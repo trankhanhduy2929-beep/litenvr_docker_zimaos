@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>LiteNVR Pro - ZimaOS Camera NVR</title>
-  <script src="static/hls.min.js"></script>
   <style>
     :root {
       --bg-body: #090c12;
@@ -3800,6 +3799,30 @@
     const PLAYBACK_SOURCES = ["auto", "local", "drive", "smb"];
     const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent || "") ||
       (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    let _hlsJsPromise = null;
+    function loadHlsJs() {
+      if (typeof Hls !== "undefined") return Promise.resolve(true);
+      if (_hlsJsPromise) return _hlsJsPromise;
+      _hlsJsPromise = new Promise(resolve => {
+        const script = document.createElement("script");
+        script.src = "static/hls.min.js";
+        script.async = true;
+        script.onload = () => resolve(typeof Hls !== "undefined");
+        script.onerror = () => { _hlsJsPromise = null; resolve(false); };
+        document.head.appendChild(script);
+      });
+      return _hlsJsPromise;
+    }
+    async function preferHlsOverWebRTC(camId) {
+      if (IS_IOS) return false;
+      try {
+        const st = await fetch(`api/status/${encodeURIComponent(camId)}`, { cache: "no-store" }).then(r => r.json());
+        const codec = String(st.detected_codec || "").toLowerCase();
+        return codec === "hevc" || codec === "h265";
+      } catch (e) {
+        return false;
+      }
+    }
     let playbackSource = (() => {
       try {
         const v = localStorage.getItem("nvrPlaybackSource") || "auto";
@@ -4292,6 +4315,7 @@
     }
 
     async function loadStatsDetails() {
+      if (document.visibilityState !== "visible") return;
       try {
         const [hist, sys] = await Promise.all([
           fetch("api/stats/history").then(r => r.ok ? r.json() : { samples: [] }).catch(() => ({ samples: [] })),
@@ -4356,7 +4380,7 @@
         tile.classList.toggle("offline", off);
         if (off) tile.setAttribute("aria-label", "Chọn camera " + info.name + " (mất kết nối)");
         const snap = info._snapshot
-          ? `<img src="${info._snapshot}" alt="">`
+          ? `<img src="${info._snapshot}" loading="lazy" decoding="async" fetchpriority="low" alt="">`
           : `<div class="tile-noimg">Không có ảnh</div>`;
         tile.innerHTML = `${snap}
           ${off ? '<span class="tile-offline">● Mất kết nối</span>' : ""}
@@ -4375,6 +4399,7 @@
     }
 
     async function refreshCamStatuses() {
+      if (document.visibilityState !== "visible") return;
       const ids = Object.keys(cameras);
       if (!ids.length) return;
       const rows = await Promise.all(ids.map(async (id) => {
@@ -4445,7 +4470,9 @@
           setCursor(sec, false);
           document.getElementById("scrubTime").textContent = "Bản ghi: " + fmtHMS(sec);
         });
-        setInterval(loadStats, 1000);
+        setInterval(() => {
+          if (document.visibilityState === "visible") loadStats();
+        }, 2000);
         setInterval(refreshSnapshots, 30000);
         setInterval(refreshCamStatuses, 15000);
         // Khi đang xem trực tiếp, tự cập nhật danh sách sự kiện để ảnh chuyển động mới hiện ra.
@@ -4499,6 +4526,7 @@
     }
 
     async function refreshSnapshots() {
+      if (document.visibilityState !== "visible") return;
       try {
         const snaps = await fetch("api/latest_snapshots").then(r => r.json());
         for (const [id, info] of Object.entries(cameras)) info._snapshot = snaps[id] || "";
@@ -5771,6 +5799,7 @@
 
     async function playLiveHls(camId, seq, statusEl) {
       const hlsUrl = `hls/${encodeURIComponent(camId)}/live.m3u8`;
+      if (!IS_IOS) await loadHlsJs();
       startLiveHeartbeat();
       video.onended = null;
       const info = await waitLiveReady(camId, seq);
@@ -5852,14 +5881,17 @@
       if (hls) { hls.destroy(); hls = null; }
       video.removeAttribute("src");
       video.srcObject = null;
-      if (await startWebRTC(camId, seq)) {
+      const preferHls = await preferHlsOverWebRTC(camId);
+      if (!preferHls && await startWebRTC(camId, seq)) {
         if (seq !== liveWaitSeq || camId !== currentCam || !liveMode) return;
         statusEl.textContent = "Đang xem trực tiếp (WebRTC - nhẹ CPU)";
         updateAudioBtn();
         return;
       }
       if (seq !== liveWaitSeq || camId !== currentCam || !liveMode) return;
-      statusEl.textContent = "WebRTC không khả dụng, chuyển sang HLS...";
+      statusEl.textContent = preferHls
+        ? "Camera H.265, chuyển sang HLS..."
+        : "WebRTC không khả dụng, chuyển sang HLS...";
       await playLiveHls(camId, seq, statusEl);
     }
 
@@ -6784,6 +6816,7 @@
 
     let _logsTimer = null, _logsData = null;
     async function updateLogBadge() {
+      if (document.visibilityState !== "visible") return;
       if (ME && !isAdmin()) return;
       try {
         const d = await fetch("api/logs?limit=50").then(r => r.json());
@@ -6949,6 +6982,8 @@
     }
 
     async function startGridPlayer(p) {
+      if (p.stopped || p.seq !== gridSeq) return;
+      if (!IS_IOS) await loadHlsJs();
       if (p.stopped || p.seq !== gridSeq) return;
       let lastErr = "";
       p.status.textContent = "Đang khởi động camera...";

@@ -164,7 +164,7 @@ Nguyên nhân phổ biến: camera dùng **H.265/HEVC** — trình duyệt (Chro
 - **Dùng luồng phụ cho Live**: điền "Luồng phụ" trong phần sửa camera (vd Imou/Dahua `subtype=1`, Hikvision `/Streaming/Channels/102`) — live thường là H.264 nên **không cần chuyển mã** (CPU gần như 0).
 - **Live theo nhu cầu**: khi không có ai xem, LiteNVR không tạo nhánh HLS/ffmpeg live; chỉ còn tiến trình ghi hình. Khi mở lại live, luồng tự khởi động trong vài giây; nếu dùng WebRTC thì camera được go2rtc kéo trực tiếp. Có thể chỉnh thời gian chờ: biến môi trường `LIVE_IDLE_STOP_SEC` (mặc định 30 giây).
 - **Ghi hình lưu nguyên codec (`-c:v copy`)**: CPU gần như bằng 0; chỉ chuyển mã khi bạn thực sự xem.
-- **Giới hạn luồng giải mã/lọc ffmpeg**: mọi ffmpeg (ghi hình, live, phát lại, xuất clip, chụp snapshot) đều bị giới hạn `-threads` cho **giải mã + bộ lọc**, không chỉ bộ mã hoá. Đổi bằng biến môi trường `FFMPEG_THREADS` (mặc định 2, kẹp 1–8). Hạ số luồng giúp giảm đỉnh RAM/CPU khi camera 2K/4K hoặc HEVC. Nếu một ffmpeg vẫn phình RAM, LiteNVR tự khởi động lại khi RSS vượt `CAMERA_MAX_RSS_MB` (mặc định 900 MB, `0` = tắt) sau 60 giây grace.
+- **Giới hạn luồng giải mã/lọc ffmpeg**: mọi ffmpeg (ghi hình, live, phát lại, xuất clip, chụp snapshot) đều bị giới hạn `-threads` cho **giải mã + bộ lọc**, không chỉ bộ mã hoá. Đổi bằng biến môi trường `FFMPEG_THREADS` (mặc định 2, kẹp 1–8). Hạ số luồng giúp giảm đỉnh RAM/CPU khi camera 2K/4K hoặc HEVC. Nếu một ffmpeg vẫn phình RAM, LiteNVR tự khởi động lại khi RSS vượt `CAMERA_MAX_RSS_MB` (mặc định 640 MB, `0` = tắt) sau 60 giây grace.
 - **Chụp snapshot có kiểm soát**: tối đa **2 ffmpeg chụp ảnh** chạy song song toàn hệ thống và **1 mỗi camera** (gộp yêu cầu trùng), tự dừng sau 12 giây nếu treo. Tránh dồn nhiều ffmpeg mở luồng cùng lúc khi có sự kiện chuyển động liên tục.
 - **Preset transcode nhẹ**: `ultrafast` + 2 luồng, `zerolatency`.
 - **Đệm Motion trong RAM**: tắt tuỳ chọn "Đệm chuyển động trong RAM" trong **⚙️ Lưu trữ** để ghi đệm ra đĩa nếu box ít RAM.
@@ -290,7 +290,7 @@ Nếu chạy ZimaOS và muốn cấu hình "chuẩn" như bản đang chạy (c�
 - `PLAYBACK_TRANSCODE_MAX=2`: số ffmpeg chuyển mã xem lại chạy đồng thời (kẹp 1–4).
 - `PLAYBACK_PRESET=ultrafast`, `PLAYBACK_CRF=23`: preset/chất lượng khi chuyển mã xem lại; preset nhanh giúp giảm CPU, CRF thấp hơn cho nét hơn.
 - `PLAYBACK_CACHE_MB=2048`, `PLAYBACK_CACHE_TTL_SEC=3600`: giới hạn dung lượng và thời gian giữ cache SMB dùng để dò/chuyển mã xem lại.
-- `CAMERA_MAX_RSS_MB=900`: tự khởi động lại ffmpeg camera nếu RAM vượt ngưỡng (chống rò rỉ/quá tải). `0` để tắt; `CAMERA_RSS_GRACE_SEC=60` là thời gian chờ trước khi kiểm tra.
+- `CAMERA_MAX_RSS_MB=640`: tự khởi động lại ffmpeg camera nếu RAM vượt ngưỡng (chống rò rỉ/quá tải). `0` để tắt; `CAMERA_RSS_GRACE_SEC=60` là thời gian chờ trước khi kiểm tra.
 - Giới hạn `cpus: "1.00"` phù hợp box yếu; muốn live mượt hơn với nhiều camera HEVC thì nâng lên `"2.00"`.
 
 Cả 2 file đều import được theo cách ở trên; nhớ sửa `source` của volume cho đúng ổ cứng của bạn.

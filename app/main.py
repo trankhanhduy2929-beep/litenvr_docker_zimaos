@@ -32,6 +32,7 @@ from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse, JSONResponse
 from starlette.background import BackgroundTask
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 # Đảm bảo trình duyệt nhận đúng MIME cho HLS (nếu thiếu, live view không phát được)
@@ -41,7 +42,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.19").strip() or "1.9.19"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.20").strip() or "1.9.20"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -269,6 +270,14 @@ async def lifespan(app: FastAPI):
         stop_go2rtc()
 
 app = FastAPI(title="LiteNVR Pro for ZimaOS", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+@app.middleware("http")
+async def static_cache_headers(request: Request, call_next):
+    resp = await call_next(request)
+    if request.url.path.startswith("/static/"):
+        resp.headers.setdefault("Cache-Control", "public, max-age=86400")
+    return resp
 
 @app.middleware("http")
 async def hls_no_cache(request: Request, call_next):
@@ -661,6 +670,7 @@ def db_conn() -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA cache_size=-512")
         _db_local.conn = conn
     conn.row_factory = sqlite3.Row
     return conn
@@ -2574,7 +2584,7 @@ def health_snapshot() -> Dict[str, dict]:
 
 # Tự khởi động lại ffmpeg nếu RSS vượt ngưỡng (chống rò rỉ/4K transcode quá nặng).
 # 0 = tắt. Chỉ áp dụng sau thời gian grace để tránh restart lúc ffmpeg mới khởi động.
-CAMERA_MAX_RSS_MB = max(0, int(os.environ.get("CAMERA_MAX_RSS_MB", "900") or "0"))
+CAMERA_MAX_RSS_MB = max(0, int(os.environ.get("CAMERA_MAX_RSS_MB", "640") or "0"))
 CAMERA_RSS_GRACE_SEC = max(10, int(os.environ.get("CAMERA_RSS_GRACE_SEC", "60") or "60"))
 
 def stream_health_supervisor():
@@ -3610,7 +3620,15 @@ def _proc_memory(pid) -> dict:
 def _proc_rss_kb(pid) -> int:
     return _proc_memory(pid).get("VmRSS", 0)
 
-def _dir_size_bytes(d: str) -> int:
+_dir_size_cache: Dict[str, tuple] = {}
+_dir_size_lock = threading.Lock()
+
+def _dir_size_bytes(d: str, max_age: float = 30.0) -> int:
+    now = time.monotonic()
+    with _dir_size_lock:
+        cached = _dir_size_cache.get(d)
+        if cached and now - cached[0] < max_age:
+            return cached[1]
     total = 0
     for root, _, files in os.walk(d):
         for fn in files:
@@ -3618,6 +3636,8 @@ def _dir_size_bytes(d: str) -> int:
                 total += os.path.getsize(os.path.join(root, fn))
             except Exception:
                 pass
+    with _dir_size_lock:
+        _dir_size_cache[d] = (now, total)
     return total
 
 def _mem_breakdown() -> dict:

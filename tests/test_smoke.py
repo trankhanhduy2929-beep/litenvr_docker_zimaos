@@ -86,6 +86,25 @@ class ApiTests(_AppCase):
         sysinfo = self.client.get("/api/system", headers=auth()).json()
         self.assertEqual(sysinfo["version"], self.m.APP_VERSION)
 
+    def test_static_assets_are_gzipped_and_cached(self):
+        r = self.client.get("/static/hls.min.js", headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers.get("content-encoding"), "gzip")
+        self.assertIn("max-age=", r.headers.get("cache-control", ""))
+
+    def test_dir_size_reuses_cache(self):
+        d = tempfile.mkdtemp(dir=self.sandbox)
+        with open(os.path.join(d, "a.bin"), "wb") as f:
+            f.write(b"x" * 32)
+        with mock.patch.object(self.m.os, "walk", wraps=os.walk) as walk:
+            self.assertGreaterEqual(self.m._dir_size_bytes(d), 32)
+            self.m._dir_size_bytes(d)
+        self.assertEqual(walk.call_count, 1)
+
+    def test_db_uses_small_page_cache(self):
+        cache_kb = self.m.db_conn().execute("PRAGMA cache_size").fetchone()[0]
+        self.assertEqual(cache_kb, -512)
+
     def test_camera_lifecycle(self):
         payload = {"cam_id": "cam1", "name": "Cam", "brand": "custom",
                    "rtsp_url": "rtsp://127.0.0.1:1/x", "record_mode": "continuous"}
