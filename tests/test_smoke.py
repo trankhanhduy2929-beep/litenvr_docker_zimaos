@@ -1723,7 +1723,25 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(snap["c1"]["fps"], 25.0)
         self.assertEqual(snap["c1"]["state"], "continue")
         self.assertIsNotNone(snap["c1"]["age_sec"])
+        self.assertTrue(self.m.cam_health["c1"].get("got_frame"))
         self.assertIn("-progress", self.m.build_ffmpeg_cmd("cam", self._cam()))
+
+    def test_stall_before_first_frame_disables_audio(self):
+        cam_id = "cam-audio-stall"
+        self.m.CONFIG.setdefault("cameras", {})[cam_id] = self._cam(audio_mode="aac")
+        try:
+            self.assertTrue(self.m._auto_disable_audio_on_stall(cam_id, {"got_frame": False}))
+            self.assertEqual(self.m.CONFIG["cameras"][cam_id]["audio_mode"], "none")
+            self.assertFalse(self.m._auto_disable_audio_on_stall(cam_id, {"got_frame": False}))
+        finally:
+            self.m.CONFIG["cameras"].pop(cam_id, None)
+        cam_id = "cam-audio-stall-after-frame"
+        self.m.CONFIG.setdefault("cameras", {})[cam_id] = self._cam(audio_mode="copy")
+        try:
+            self.assertFalse(self.m._auto_disable_audio_on_stall(cam_id, {"got_frame": True}))
+            self.assertEqual(self.m.CONFIG["cameras"][cam_id]["audio_mode"], "copy")
+        finally:
+            self.m.CONFIG["cameras"].pop(cam_id, None)
 
     def test_audio_au_headers_is_recoverable_warning(self):
         line = "[rtsp @ 0x55a114f72400] Error parsing AU headers"

@@ -42,7 +42,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.21").strip() or "1.9.21"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.22").strip() or "1.9.22"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -2553,6 +2553,12 @@ def _note_progress(line: str, cam_id: str) -> bool:
     h = cam_health.setdefault(cam_id, {})
     if key in _PROGRESS_FRAME_KEYS:
         h["last_frame_at"] = time.time()
+        if key == "frame":
+            try:
+                if int(val) > 0:
+                    h["got_frame"] = True
+            except ValueError:
+                pass
     if key == "fps":
         try:
             h["fps"] = float(val)
@@ -2587,6 +2593,30 @@ def health_snapshot() -> Dict[str, dict]:
 CAMERA_MAX_RSS_MB = max(0, int(os.environ.get("CAMERA_MAX_RSS_MB", "640") or "0"))
 CAMERA_RSS_GRACE_SEC = max(10, int(os.environ.get("CAMERA_RSS_GRACE_SEC", "60") or "60"))
 
+def _auto_disable_audio_on_stall(cam_id: str, health: dict) -> bool:
+    """Tắt âm thanh khi luồng đứng trước khung hình đầu tiên.
+
+    Một số NVR/go2rtc gửi audio RTSP hỏng làm ffmpeg chờ vô hạn ở bước map
+    audio, không bao giờ ghi khung hình. Video-only vẫn chạy bình thường.
+    """
+    if health.get("got_frame"):
+        return False
+    cam = (CONFIG.get("cameras") or {}).get(cam_id)
+    if not isinstance(cam, dict):
+        return False
+    if str(cam.get("audio_mode") or "aac").strip().lower() == "none":
+        return False
+    cam["audio_mode"] = "none"
+    saved = True
+    try:
+        save_config(CONFIG)
+    except Exception as e:
+        saved = False
+        log_event("warn", f"Không lưu được cấu hình tắt âm thanh: {e}", cam_id)
+    log_event("warn", "Luồng đứng trước khi có khung hình; tự tắt âm thanh để video chạy tiếp"
+              + ("" if saved else " (chưa lưu được cấu hình)"), cam_id)
+    return True
+
 def stream_health_supervisor():
     """Theo dõi tiến độ ffmpeg mỗi camera; khởi động lại nếu luồng đứng hoặc RAM quá cao."""
     stall_sec = 20
@@ -2602,7 +2632,8 @@ def stream_health_supervisor():
                 h["stalled"] = stalled
                 if stalled and not h.get("restart_attempted"):
                     h["restart_attempted"] = True
-                    log_event("warn", f"Luồng đứng >{stall_sec}s (không có khung mới), khởi động lại", cam_id)
+                    if not _auto_disable_audio_on_stall(cam_id, h):
+                        log_event("warn", f"Luồng đứng >{stall_sec}s (không có khung mới), khởi động lại", cam_id)
                     _restart_camera_process(cam_id, proc)
                 elif not stalled:
                     h["restart_attempted"] = False
