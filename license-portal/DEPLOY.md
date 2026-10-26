@@ -120,7 +120,7 @@ curl -s https://<domain>/api/health
 
 curl -s -X POST https://<domain>/api/license/activate \
   -H 'Content-Type: application/json' \
-  -d '{"key":"LITE-XXXX-XXXX-XXXX","installation_id":"test-device","version":"1.9.20"}'
+  -d '{"key":"LITE-XXXX-XXXX-XXXX","installation_id":"test-device","version":"1.9.21"}'
 ```
 
 Kết quả hợp lệ có `valid: true`, `plan`, `expires_at`, `token`. Nhớ gỡ máy test

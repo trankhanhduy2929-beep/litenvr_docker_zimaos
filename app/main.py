@@ -42,7 +42,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.20").strip() or "1.9.20"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.21").strip() or "1.9.21"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -2092,12 +2092,12 @@ def _line_hits_source(line: str, url: str) -> bool:
     low = (line or "").lower()
     if not low:
         return False
-    markers = ("404", "401", "403", "server returned 5",
+    markers = ("400", "404", "401", "403", "server returned 5",
                "connection refused", "timed out", "no route")
     if url and url in (line or ""):
         return any(marker in low for marker in markers)
     if "method describe failed" in low:
-        return any(marker in low for marker in ("404", "401", "403", "5"))
+        return any(marker in low for marker in ("400", "404", "401", "403", "5"))
     return False
 
 def _g2_live_name(cam_id: str, cam_info: dict) -> str:
@@ -2764,6 +2764,9 @@ def _camera_worker_loop(cam_id: str, token: threading.Event):
                 return ("Nguồn H.265 có tham số PPS/SPS/NAL không chuẩn (thường từ NVR/go2rtc) — "
                         "video có thể vẫn phát bình thường; nếu hình không lên, dùng luồng phụ "
                         "H.264 hoặc luồng H.264 từ NVR: " + line)
+            if "400 bad request" in low or "server returned 400" in low:
+                return ("Camera/NVR trả 400 Bad Request: sai kênh hoặc đường dẫn RTSP, hoặc luồng phụ "
+                        "không tồn tại (Hik: 101/102 = kênh 1, 201/202 = kênh 2...): " + line)
             if ("server returned 404" in low or "404 not found" in low) and _go2rtc.get("running"):
                 return ("Nguồn camera lỗi khi lấy qua restream go2rtc (sai URL/tài khoản hoặc cam đang bận): " + line)
             if "5xx" in low or "server returned 5" in low or "453" in low or "454" in low or "461" in low:
@@ -4180,8 +4183,8 @@ async def api_live_webrtc(cam_id: str, request: Request):
                 return resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace").strip()
-            if exc.code == 404:
-                _mark_stream_failure(cam_id, cam_info, "sub" if is_sub else "restream", "go2rtc 404")
+            if exc.code in (400, 404):
+                _mark_stream_failure(cam_id, cam_info, "sub" if is_sub else "restream", f"go2rtc {exc.code}")
             log_event("warn", f"WebRTC go2rtc lỗi ({src_name}): {mask_secrets(detail)[:200]}", cam_id)
             raise HTTPException(status_code=502, detail=detail[:300] or f"go2rtc HTTP {exc.code}")
         except Exception as exc:

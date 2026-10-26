@@ -1659,6 +1659,13 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(off.count("-i"), 1)
         self.assertIn("sub", off[off.index("-i") + 1])
 
+    def test_rtsp_400_marks_substream_failure(self):
+        self.assertTrue(self.m._line_hits_source(
+            "rtsp://cam.invalid/sub: Server returned 400 Bad Request",
+            "rtsp://cam.invalid/sub"))
+        self.assertTrue(self.m._line_hits_source(
+            "[rtsp @ 0x1] method DESCRIBE failed: 400 Bad Request", ""))
+
     def test_substream_failure_falls_back_to_main(self):
         cam_id = "cam-source-subfail"
         cam = self._cam(rtsp_url="rtsp://cam.invalid/main", sub_rtsp_url="rtsp://cam.invalid/sub")
