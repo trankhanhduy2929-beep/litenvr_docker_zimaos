@@ -196,6 +196,45 @@ class ApiTests(_AppCase):
         self.assertIn("/api/webrtc?src=cam-webrtc-sub_sub", captured["url"])
         self.assertEqual(r.headers["X-LiteNVR-WebRTC-Source"], "cam-webrtc-sub_sub")
 
+    def test_webrtc_substream_404_retries_main(self):
+        payload = {"cam_id": "cam-webrtc-404", "name": "Cam", "brand": "custom",
+                   "rtsp_url": "rtsp://127.0.0.1:1/main",
+                   "sub_rtsp_url": "rtsp://127.0.0.1:1/sub", "record_mode": "continuous"}
+        self.client.post("/api/cameras", json=payload, headers=auth())
+        sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=end-of-candidates\r\n"
+        calls = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def read(self):
+                return sdp.encode()
+
+        def fake_urlopen(req, timeout=0):
+            calls.append(req.full_url)
+            if "_sub" in req.full_url:
+                raise self.m.urllib.error.HTTPError(
+                    req.full_url, 404, "Not Found", {}, io.BytesIO(b"not found"))
+            return FakeResponse()
+
+        old = self.m._go2rtc.get("running")
+        self.m._go2rtc["running"] = True
+        try:
+            with mock.patch.object(self.m.urllib.request, "urlopen", fake_urlopen):
+                r = self.client.post(
+                    "/api/live/cam-webrtc-404/webrtc", content=sdp,
+                    headers={**auth(), "Content-Type": "application/sdp"})
+        finally:
+            self.m._go2rtc["running"] = old
+            self.m._clear_stream_failures("cam-webrtc-404")
+            self.client.delete("/api/cameras/cam-webrtc-404", headers=auth())
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertIn("/api/webrtc?src=cam-webrtc-404_sub", calls[0])
+        self.assertIn("/api/webrtc?src=cam-webrtc-404", calls[1])
+        self.assertEqual(r.headers["X-LiteNVR-WebRTC-Source"], "cam-webrtc-404")
+
     def test_storage_motion_timeline(self):
         payload = {"cam_id": "cam1", "name": "Cam", "rtsp_url": "rtsp://127.0.0.1:1/x",
                    "record_mode": "motion", "video_codec": "h264"}
@@ -1600,6 +1639,43 @@ class BuilderTests(unittest.TestCase):
         off = self.m.build_ffmpeg_cmd("cam", self._cam(record_mode="off", video_codec="copy"), include_live=True)
         self.assertEqual(off.count("-i"), 1)
         self.assertIn("sub", off[off.index("-i") + 1])
+
+    def test_substream_failure_falls_back_to_main(self):
+        cam_id = "cam-source-subfail"
+        cam = self._cam(rtsp_url="rtsp://cam.invalid/main", sub_rtsp_url="rtsp://cam.invalid/sub")
+        self.m.CONFIG.setdefault("cameras", {})[cam_id] = cam
+        old_running = self.m._go2rtc["running"]
+        self.m._go2rtc["running"] = True
+        try:
+            main, sub = self.m.cam_source_urls(cam_id, cam)
+            self.assertTrue(main.endswith("/" + cam_id))
+            self.assertTrue(sub.endswith("/" + cam_id + "_sub"))
+            self.m._mark_stream_failure(cam_id, cam, "sub", "test")
+            main2, sub2 = self.m.cam_source_urls(cam_id, cam)
+            self.assertEqual(main2, main)
+            self.assertEqual(sub2, main2)
+            cmd = self.m.build_ffmpeg_cmd(cam_id, cam, video_codec="h264", include_live=True)
+            self.assertEqual(cmd.count("-i"), 1)
+        finally:
+            self.m._go2rtc["running"] = old_running
+            self.m._clear_stream_failures(cam_id)
+            self.m.CONFIG["cameras"].pop(cam_id, None)
+
+    def test_restream_failure_uses_direct_source(self):
+        cam_id = "cam-source-restream"
+        cam = self._cam(rtsp_url="rtsp://cam.invalid/main", sub_rtsp_url="rtsp://cam.invalid/sub")
+        self.m.CONFIG.setdefault("cameras", {})[cam_id] = cam
+        old_running = self.m._go2rtc["running"]
+        self.m._go2rtc["running"] = True
+        try:
+            self.m._mark_stream_failure(cam_id, cam, "restream", "test")
+            main, sub = self.m.cam_source_urls(cam_id, cam)
+            self.assertEqual(main, cam["rtsp_url"])
+            self.assertEqual(sub, cam["sub_rtsp_url"])
+        finally:
+            self.m._go2rtc["running"] = old_running
+            self.m._clear_stream_failures(cam_id)
+            self.m.CONFIG["cameras"].pop(cam_id, None)
 
     def test_runtime_live_downscale(self):
         cmd = self.m.build_ffmpeg_cmd("cam", self._cam(record_mode="copy", video_codec="h264"))

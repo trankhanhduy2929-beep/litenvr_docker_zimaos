@@ -41,7 +41,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.18").strip() or "1.9.18"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.19").strip() or "1.9.19"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -2022,12 +2022,81 @@ def _g2_name(cam_id: str) -> str:
     """Tên stream an toàn cho go2rtc (không dấu cách/ký tự đặc biệt)."""
     return re.sub(r"[^A-Za-z0-9_.\-]", "_", cam_id)
 
+# Camera/NVR có thể trả 404 cho luồng phụ (URL cũ, đủ phiên, H.265 lỗi tham số).
+# Ghi nhớ lỗi trong 10 phút để tự dùng luồng chính thay vì lặp lại lỗi.
+STREAM_FAIL_RETRY_SEC = 600
+_stream_fail: Dict[str, dict] = {}
+_stream_fail_lock = threading.Lock()
+
+def _cam_source_sig(cam_info: dict):
+    return ((cam_info.get("rtsp_url") or "").strip(),
+            (cam_info.get("sub_rtsp_url") or "").strip())
+
+def _stream_fail_until(cam_id: str, cam_info: dict, kind: str) -> float:
+    sig = _cam_source_sig(cam_info)
+    now = time.time()
+    with _stream_fail_lock:
+        rec = _stream_fail.get(cam_id)
+        if not rec or rec.get("sig") != sig:
+            return 0.0
+        until = float(rec.get(kind) or 0)
+        if until <= now:
+            rec.pop(kind, None)
+            rec.pop(f"{kind}_reason", None)
+            if not any(rec.get(k) for k in ("sub", "restream")):
+                _stream_fail.pop(cam_id, None)
+            return 0.0
+        return until
+
+def _substream_usable(cam_id: str, cam_info: dict) -> bool:
+    return _stream_fail_until(cam_id, cam_info, "sub") <= 0
+
+def _restream_usable(cam_id: str, cam_info: dict) -> bool:
+    return _stream_fail_until(cam_id, cam_info, "restream") <= 0
+
+def _mark_stream_failure(cam_id: str, cam_info: dict, kind: str, reason: str = ""):
+    if kind not in ("sub", "restream"):
+        return
+    sig = _cam_source_sig(cam_info)
+    now = time.time()
+    with _stream_fail_lock:
+        rec = _stream_fail.get(cam_id)
+        if not rec or rec.get("sig") != sig:
+            rec = {"sig": sig}
+        previous = float(rec.get(kind) or 0)
+        rec[kind] = now + STREAM_FAIL_RETRY_SEC
+        rec[f"{kind}_reason"] = reason
+        _stream_fail[cam_id] = rec
+    if previous > now:
+        return
+    if kind == "sub":
+        log_event("warn", "Luồng phụ lỗi; tự chuyển sang luồng chính cho live/ghi hình", cam_id)
+    else:
+        log_event("warn", "Restream go2rtc lỗi; tạm nối trực tiếp camera", cam_id)
+
+def _clear_stream_failures(cam_id: str):
+    with _stream_fail_lock:
+        _stream_fail.pop(cam_id, None)
+
+def _line_hits_source(line: str, url: str) -> bool:
+    low = (line or "").lower()
+    if not low:
+        return False
+    markers = ("404", "401", "403", "server returned 5",
+               "connection refused", "timed out", "no route")
+    if url and url in (line or ""):
+        return any(marker in low for marker in markers)
+    if "method describe failed" in low:
+        return any(marker in low for marker in ("404", "401", "403", "5"))
+    return False
+
 def _g2_live_name(cam_id: str, cam_info: dict) -> str:
     """Stream go2rtc cho live/WebRTC: ưu tiên luồng phụ (nhẹ CPU/băng thông)."""
     name = _g2_name(cam_id)
     main = (cam_info.get("rtsp_url") or "").strip()
     sub = (cam_info.get("sub_rtsp_url") or "").strip()
-    return f"{name}_sub" if sub and sub != main else name
+    use_sub = bool(sub and sub != main and _substream_usable(cam_id, cam_info))
+    return f"{name}_sub" if use_sub else name
 
 def _go2rtc_streams() -> Dict[str, str]:
     """Tên stream go2rtc -> URL gốc. Camera có luồng phụ tạo thêm <cam>_sub."""
@@ -2183,6 +2252,8 @@ def cam_source_urls(cam_id: str, cam_info: dict):
     (1 phiên/camera cho mọi nhu cầu ghi + live + snapshot)."""
     main_url = cam_info.get("rtsp_url", "")
     sub_url = cam_info.get("sub_rtsp_url") or main_url
+    if sub_url != main_url and not _substream_usable(cam_id, cam_info):
+        sub_url = main_url
     if _go2rtc.get("running") and (cam_info.get("rtsp_url") or "").strip():
         name = _g2_name(cam_id)
         streams = _go2rtc_streams()
@@ -2195,9 +2266,10 @@ def cam_source_urls(cam_id: str, cam_info: dict):
                 if not st.get("_self_loop_warn"):
                     st["_self_loop_warn"] = True
                     log_event("warn", f"Camera {cam_id} đang trỏ vào chính restream nội bộ — bỏ qua restream để tránh vòng lặp", cam_id)
-            else:
+            elif _restream_usable(cam_id, cam_info):
+                want_sub = sub_url != main_url
                 main_url = f"{GO2RTC_RTSP}/{name}"
-                sub_url = f"{GO2RTC_RTSP}/{name}_sub" if f"{name}_sub" in streams else main_url
+                sub_url = f"{GO2RTC_RTSP}/{name}_sub" if want_sub and f"{name}_sub" in streams else main_url
     return main_url, sub_url
 
 def webrtc_candidate_host(request: Request) -> str:
@@ -2635,6 +2707,8 @@ def _camera_worker_loop(cam_id: str, token: threading.Event):
         eff_info["record_mode"] = sched if sched != "off" else "off"
         if include_live:
             _clear_hls_playlist(cam_id)
+        main_url, sub_url = cam_source_urls(cam_id, eff_info)
+        substream_in_use = include_live and sub_url != main_url
         cmd = build_ffmpeg_cmd(cam_id, eff_info, video_codec=resolved, include_live=include_live)
         started = time.time()
         try:
@@ -2693,7 +2767,7 @@ def _camera_worker_loop(cam_id: str, token: threading.Event):
                 return "Luồng RTSP không hợp lệ hoặc sai đường dẫn: " + line
             return line
 
-        def _drain(p, cid, status):
+        def _drain(p, cid, status, src_main, src_sub):
             warned = False
             audio_warned = False
             hevc_warned = False
@@ -2708,6 +2782,10 @@ def _camera_worker_loop(cam_id: str, token: threading.Event):
                     if _REPEATED_LOG_RE.match(line):
                         continue
                     low = line.lower()
+                    if substream_in_use and _line_hits_source(line, src_sub):
+                        _mark_stream_failure(cid, eff_info, "sub", "luồng phụ lỗi")
+                    elif src_main.startswith(GO2RTC_RTSP) and _line_hits_source(line, src_main):
+                        _mark_stream_failure(cid, eff_info, "restream", "restream lỗi")
                     if _is_audio_au_warning(line):
                         status["last_warning"] = _hint(line)
                         if not audio_warned:
@@ -2735,7 +2813,7 @@ def _camera_worker_loop(cam_id: str, token: threading.Event):
                 pass
 
         st["rate_limited"] = False
-        drain = threading.Thread(target=_drain, args=(proc, cam_id, st), daemon=True)
+        drain = threading.Thread(target=_drain, args=(proc, cam_id, st, main_url, sub_url), daemon=True)
         drain.start()
         proc.wait()
         exit_code = proc.returncode
@@ -4063,10 +4141,16 @@ async def api_live_webrtc(cam_id: str, request: Request):
     offer = await request.body()
     if not offer or len(offer) > 2_000_000:
         raise HTTPException(status_code=400, detail="SDP offer không hợp lệ")
-    name = _g2_live_name(cam_id, CONFIG["cameras"][cam_id])
-    url = f"http://127.0.0.1:1984/api/webrtc?src={urllib.parse.quote(name)}"
+    cam_info = CONFIG["cameras"][cam_id]
+    if not _restream_usable(cam_id, cam_info):
+        raise HTTPException(status_code=503, detail="Restream go2rtc tạm lỗi; chuyển sang HLS trực tiếp")
+    main_name = _g2_name(cam_id)
+    sub_name = f"{main_name}_sub"
+    name = _g2_live_name(cam_id, cam_info)
 
-    def exchange():
+    def exchange(src_name: str):
+        is_sub = src_name == sub_name and sub_name != main_name
+        url = f"http://127.0.0.1:1984/api/webrtc?src={urllib.parse.quote(src_name)}"
         req = urllib.request.Request(
             url, data=offer, method="POST",
             headers={"Content-Type": "application/sdp", "User-Agent": "LiteNVR-WebRTC"},
@@ -4076,13 +4160,24 @@ async def api_live_webrtc(cam_id: str, request: Request):
                 return resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace").strip()
-            log_event("warn", f"WebRTC go2rtc lỗi ({name}): {mask_secrets(detail)[:200]}", cam_id)
+            if exc.code == 404:
+                _mark_stream_failure(cam_id, cam_info, "sub" if is_sub else "restream", "go2rtc 404")
+            log_event("warn", f"WebRTC go2rtc lỗi ({src_name}): {mask_secrets(detail)[:200]}", cam_id)
             raise HTTPException(status_code=502, detail=detail[:300] or f"go2rtc HTTP {exc.code}")
         except Exception as exc:
-            log_event("warn", f"WebRTC không kết nối được go2rtc ({name}): {mask_secrets(str(exc))[:200]}", cam_id)
+            log_event("warn", f"WebRTC không kết nối được go2rtc ({src_name}): {mask_secrets(str(exc))[:200]}", cam_id)
             raise HTTPException(status_code=502, detail=f"Không kết nối được go2rtc: {exc}")
 
-    answer = await asyncio.to_thread(exchange)
+    try:
+        answer = await asyncio.to_thread(exchange, name)
+    except HTTPException:
+        if name == sub_name and sub_name != main_name \
+                and main_name in _go2rtc_streams() and _restream_usable(cam_id, cam_info):
+            log_event("warn", "WebRTC luồng phụ lỗi; thử lại bằng luồng chính", cam_id)
+            name = main_name
+            answer = await asyncio.to_thread(exchange, main_name)
+        else:
+            raise
     if not answer.startswith("v="):
         log_event("warn", f"WebRTC nhận SDP không hợp lệ ({name})", cam_id)
         raise HTTPException(status_code=502, detail="go2rtc trả về SDP không hợp lệ")
@@ -4116,6 +4211,7 @@ def delete_camera(cam_id: str):
         if b.get("cameras"):
             b["cameras"] = [c for c in b["cameras"] if c != cam_id]
         codec_cache.pop(cam_id, None)
+        _clear_stream_failures(cam_id)
         cam_status.pop(cam_id, None)
         with _cam_offline_lock:
             _cam_offline.pop(cam_id, None)
@@ -8345,6 +8441,8 @@ def get_cam_status(cam_id: str, request: Request):
         "detected_profile": st.get("detected_profile", ""),
         "detected_pix_fmt": st.get("detected_pix_fmt", ""),
         "detect_failed": bool(st.get("detect_failed", False)),
+        "substream_fallback": not _substream_usable(cam_id, cam),
+        "restream_bypass": not _restream_usable(cam_id, cam),
         "rate_limited": bool(st.get("rate_limited", False)),
         "last_warning": last_warning,
         "last_error": last_error,
