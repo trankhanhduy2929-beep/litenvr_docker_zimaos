@@ -1,7 +1,7 @@
 ARG BASE_IMAGE=ghcr.io/trankhanhduy2929-beep/litenvr_docker_zimaos:latest
 FROM ${BASE_IMAGE}
 
-ARG BUILD_VERSION=1.9.22
+ARG BUILD_VERSION=1.9.23
 ARG BUILD_ARCH=amd64
 
 LABEL io.hass.version="${BUILD_VERSION}" \

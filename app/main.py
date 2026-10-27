@@ -42,7 +42,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.22").strip() or "1.9.22"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.23").strip() or "1.9.23"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -1197,6 +1197,7 @@ worker_tokens: Dict[str, threading.Event] = {}
 worker_lock = threading.Lock()
 _shutdown = threading.Event()
 FFMPEG_THREADS = max(1, min(8, int(os.environ.get("FFMPEG_THREADS", "2") or "2")))
+LIVE_TRANSCODE_THREADS = 1
 _snapshot_lock = threading.Lock()
 _ha_snapshot_lock = threading.Lock()
 _snapshot_slots = threading.BoundedSemaphore(2)
@@ -1211,6 +1212,9 @@ LIVE_IDLE_STOP_SEC = int(os.environ.get("LIVE_IDLE_STOP_SEC", "30"))
 # Chiều cao tối đa cho live HLS khi phải chuyển mã (0 = giữ nguyên gốc).
 # Hạ độ phân giải live giúp CPU giảm mạnh với camera 2K/4K (bản ghi vẫn giữ nguyên gốc).
 LIVE_MAX_HEIGHT = int(os.environ.get("LIVE_MAX_HEIGHT", "720") or "0")
+# Live H.265/HEVC phải decode + encode; cap thấp để giảm RAM/CPU. Có thể nâng
+# bằng biến môi trường LIVE_TRANSCODE_MAX_HEIGHT (0 = không cap).
+LIVE_TRANSCODE_MAX_HEIGHT = int(os.environ.get("LIVE_TRANSCODE_MAX_HEIGHT", "576") or "0")
 # HLS độ trễ thấp: segment 1 giây và playlist ngắn để trình duyệt bám sát live edge.
 # Tăng LIVE_HLS_TIME/LIVE_HLS_LIST nếu mạng Wi-Fi yếu hoặc camera có GOP dài.
 LIVE_HLS_TIME = max(1, min(10, int(os.environ.get("LIVE_HLS_TIME", "1") or "1")))
@@ -1965,14 +1969,16 @@ def onvif_ptz_presets(cam_id: str) -> list:
 def _is_rtsp(url: str) -> bool:
     return (url or "").lower().startswith(("rtsp://", "rtsps://"))
 
-def _ffmpeg_base_args() -> List[str]:
+def _ffmpeg_base_args(threads: Optional[int] = None) -> List[str]:
+    n = FFMPEG_THREADS if threads is None else max(1, int(threads))
     return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-filter_threads", str(FFMPEG_THREADS),
-            "-filter_complex_threads", str(FFMPEG_THREADS)]
+            "-filter_threads", str(n),
+            "-filter_complex_threads", str(n)]
 
 
-def _input_args(url: str, cam_info: dict) -> List[str]:
-    args = ["-threads", str(FFMPEG_THREADS)]
+def _input_args(url: str, cam_info: dict, threads: Optional[int] = None) -> List[str]:
+    n = FFMPEG_THREADS if threads is None else max(1, int(threads))
+    args = ["-threads", str(n)]
     if _is_rtsp(url):
         args += [
             "-rtsp_transport", cam_info.get("rtsp_transport", "tcp"),
@@ -2347,14 +2353,16 @@ def build_ffmpeg_cmd(cam_id: str, cam_info: dict, video_codec: Optional[str] = N
     record_mode = cam_info.get("record_mode", "continuous")  # continuous | motion | off
     if video_codec is None:
         video_codec = resolve_video_codec(cam_id, cam_info)  # copy | h264 cho LIVE
+    live_transcode = include_live and video_codec == "h264"
+    live_threads = LIVE_TRANSCODE_THREADS if live_transcode else FFMPEG_THREADS
     # Bản ghi LUÔN copy codec gốc để nhẹ CPU/RAM (kể cả HEVC). Khi xem lại sẽ tự
     # chuyển mã. Lựa chọn "h264" chỉ ép transcode cho LUỒNG LIVE.
 
     # H.264 transcode cho LUỒNG LIVE khi camera dùng H.265/HEVC (trình duyệt không phát được HEVC)
-    # ultrafast + 2 thread: giảm mạnh CPU/RAM so với veryfast mà vẫn đủ nét cho live.
+    # ultrafast + 1 thread: giảm mạnh CPU/RAM so với veryfast mà vẫn đủ nét cho live.
     h264_args = [
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-threads", str(FFMPEG_THREADS), "-g", "50", "-sc_threshold", "0", "-pix_fmt", "yuv420p",
+        "-threads", str(live_threads), "-g", "50", "-sc_threshold", "0", "-pix_fmt", "yuv420p",
     ]
     vcodec_args = h264_args if video_codec == "h264" else ["-c:v", "copy"]
 
@@ -2366,9 +2374,9 @@ def build_ffmpeg_cmd(cam_id: str, cam_info: dict, video_codec: Optional[str] = N
 
     input_url = sub_url if include_live and record_mode == "off" else main_url
     cmd = [
-        *_ffmpeg_base_args(),
+        *_ffmpeg_base_args(live_threads),
         "-fflags", "+genpts+igndts+discardcorrupt",
-        *_input_args(input_url, cam_info),
+        *_input_args(input_url, cam_info, live_threads),
         "-i", input_url,
     ]
 
@@ -2377,7 +2385,7 @@ def build_ffmpeg_cmd(cam_id: str, cam_info: dict, video_codec: Optional[str] = N
     if use_dual_input:
         cmd.extend([
             "-fflags", "+genpts+igndts+discardcorrupt",
-            *_input_args(sub_url, cam_info),
+            *_input_args(sub_url, cam_info, live_threads),
             "-i", sub_url
         ])
 
@@ -2413,8 +2421,11 @@ def build_ffmpeg_cmd(cam_id: str, cam_info: dict, video_codec: Optional[str] = N
         if video_codec == "h264":
             # Ép keyframe đúng nhịp segment để HLS không phải chờ GOP dài của camera.
             live_args += ["-force_key_frames", f"expr:gte(t,n_forced*{LIVE_HLS_TIME})"]
-            if LIVE_MAX_HEIGHT > 0:
-                live_args = ["-vf", f"scale=-2:'min({LIVE_MAX_HEIGHT},ih)'"] + live_args
+            live_h = LIVE_MAX_HEIGHT
+            if LIVE_TRANSCODE_MAX_HEIGHT > 0:
+                live_h = min(live_h, LIVE_TRANSCODE_MAX_HEIGHT) if live_h > 0 else LIVE_TRANSCODE_MAX_HEIGHT
+            if live_h > 0:
+                live_args = ["-vf", f"scale=-2:'min({live_h},ih)'"] + live_args
         live_audio = []
         if audio_mode != "none":
             live_audio = ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "64k", "-ac", "1"]
@@ -3791,6 +3802,7 @@ def get_system_info():
         "cam_health": health_snapshot(),
         "live_idle_stop_sec": LIVE_IDLE_STOP_SEC,
         "live_max_height": LIVE_MAX_HEIGHT,
+        "live_transcode_max_height": LIVE_TRANSCODE_MAX_HEIGHT,
         "go2rtc": {
             "mode": GO2RTC_MODE,
             "available": go2rtc_available(),

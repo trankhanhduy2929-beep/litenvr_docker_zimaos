@@ -1708,8 +1708,29 @@ class BuilderTests(unittest.TestCase):
         self.assertIn("-vf", cmd)
         vf = self._values(cmd, "-vf")[0]
         self.assertIn("min(", vf)
-        self.assertIn("720", vf)
+        self.assertIn("576", vf)
         self.assertIn("ih", vf)
+
+    def test_live_transcode_uses_one_thread(self):
+        cam = self._cam(record_mode="off", video_codec="h264", sub_rtsp_url="")
+        cmd = self.m.build_ffmpeg_cmd("cam", cam)
+        self.assertEqual(self._values(cmd, "-filter_threads"), ["1"])
+        self.assertEqual(self._values(cmd, "-filter_complex_threads"), ["1"])
+        self.assertEqual(self._values(cmd, "-threads"), ["1", "1"])
+        self.assertIn("min(576,ih)", self._values(cmd, "-vf")[0])
+
+    def test_copy_live_keeps_default_threads(self):
+        cam = self._cam(record_mode="off", video_codec="copy", sub_rtsp_url="")
+        cmd = self.m.build_ffmpeg_cmd("cam", cam)
+        self.assertEqual(self._values(cmd, "-filter_threads"), ["2"])
+        self.assertNotIn("-vf", cmd)
+        self.assertEqual(self._values(cmd, "-threads"), ["2"])
+
+    def test_live_transcode_height_cap_can_be_disabled(self):
+        cam = self._cam(record_mode="off", video_codec="h264", sub_rtsp_url="")
+        with mock.patch.object(self.m, "LIVE_TRANSCODE_MAX_HEIGHT", 0):
+            cmd = self.m.build_ffmpeg_cmd("cam", cam)
+        self.assertIn("min(720,ih)", self._values(cmd, "-vf")[0])
 
     def test_stream_health_progress(self):
         self.m.cam_health.clear()
