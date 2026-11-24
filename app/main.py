@@ -42,7 +42,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.23").strip() or "1.9.23"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.24").strip() or "1.9.24"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -77,6 +77,7 @@ DRIVE_API_BASE = os.environ.get("NVR_DRIVE_API_BASE", "https://www.googleapis.co
 DRIVE_UPLOAD_BASE = os.environ.get("NVR_DRIVE_UPLOAD_BASE", "https://www.googleapis.com/upload/drive/v3").rstrip("/")
 DRIVE_SCOPE = os.environ.get("NVR_DRIVE_SCOPE", "https://www.googleapis.com/auth/drive.file")
 DRIVE_TICK = float(os.environ.get("NVR_DRIVE_TICK", "20"))
+DRIVE_SCAN_SEC = max(DRIVE_TICK, float(os.environ.get("NVR_DRIVE_SCAN_SEC", "60") or "60"))
 DRIVE_CHUNK = int(os.environ.get("NVR_DRIVE_CHUNK", str(16 * 1024 * 1024)))
 DRIVE_RETRY_BASE = float(os.environ.get("NVR_DRIVE_RETRY_BASE", "60"))
 DRIVE_MAX_PARALLEL = 64
@@ -671,9 +672,25 @@ def db_conn() -> sqlite3.Connection:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA cache_size=-512")
+        conn.execute("PRAGMA wal_autocheckpoint=1000")
+        conn.execute("PRAGMA journal_size_limit=67108864")
         _db_local.conn = conn
     conn.row_factory = sqlite3.Row
     return conn
+
+def db_checkpoint(truncate: bool = False) -> None:
+    """Gộp WAL vào DB và cắt WAL sau checkpoint khi có thể (không chặn app)."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA journal_size_limit=67108864")
+            mode = "TRUNCATE" if truncate else "PASSIVE"
+            conn.execute(f"PRAGMA wal_checkpoint({mode})")
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 def init_db():
     conn = db_conn()
@@ -726,6 +743,7 @@ def init_db():
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_drive_status ON drive_uploads(status, next_try)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_drive_ts ON drive_uploads(ts)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_drive_cam_path ON drive_uploads(cam_id, path)")
     c.execute("""
         CREATE TABLE IF NOT EXISTS backup_done (
             path TEXT PRIMARY KEY,
@@ -748,6 +766,7 @@ def init_db():
     conn.commit()
 
 init_db()
+db_checkpoint(truncate=True)
 
 def locked_paths() -> set:
     """Tập hợp các bản ghi được khoá (cam_id/fname) — không bị tự động xoá."""
@@ -3488,6 +3507,7 @@ def cleanup_worker():
             run_cleanup_now()
             check_corrupt_recordings()
             purge_sessions()
+            db_checkpoint(truncate=True)
         except Exception:
             pass
         time.sleep(300)  # Kiểm tra dọn ổ cứng mỗi 5 phút
@@ -7689,34 +7709,43 @@ def drive_scan_once():
     now = time.time()
     conn = db_conn()
     added = 0
-    for cam_id in list(CONFIG.get("cameras", {}).keys()):
-        if not cam_uploads_drive(cam_id):
-            continue
-        cam_dir = os.path.join(RECORDINGS_DIR, cam_id)
-        if not os.path.isdir(cam_dir):
-            continue
-        try:
-            names = sorted(f for f in os.listdir(cam_dir) if REC_NAME_RE.match(f))
-        except Exception:
-            continue
-        for name in names:
-            fpath = os.path.join(cam_dir, name)
+    try:
+        for cam_id in list(CONFIG.get("cameras", {}).keys()):
+            if not cam_uploads_drive(cam_id):
+                continue
+            cam_dir = os.path.join(RECORDINGS_DIR, cam_id)
+            if not os.path.isdir(cam_dir):
+                continue
             try:
-                st = os.stat(fpath)
+                names = sorted(f for f in os.listdir(cam_dir) if REC_NAME_RE.match(f))
             except Exception:
                 continue
-            if now - st.st_mtime < 10:
-                continue  # vừa chốt xong, chờ ổn định
-            ts = _rec_name_ts(name) or st.st_mtime
-            if ts < since:
-                continue
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO drive_uploads (path, cam_id, name, ts, size, status, tries, next_try, updated) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?)",
-                (f"{cam_id}/{name}", cam_id, name, ts, st.st_size, now))
-            added += cur.rowcount
-    if added:
-        conn.commit()
+            existing = {r[0] for r in conn.execute(
+                "SELECT path FROM drive_uploads WHERE cam_id=?", (cam_id,))}
+            for name in names:
+                fpath = os.path.join(cam_dir, name)
+                try:
+                    st = os.stat(fpath)
+                except Exception:
+                    continue
+                if now - st.st_mtime < 10:
+                    continue  # vừa chốt xong, chờ ổn định
+                ts = _rec_name_ts(name) or st.st_mtime
+                if ts < since:
+                    continue
+                rel = f"{cam_id}/{name}"
+                if rel in existing:
+                    continue
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO drive_uploads (path, cam_id, name, ts, size, status, tries, next_try, updated) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, ?)",
+                    (rel, cam_id, name, ts, st.st_size, now))
+                added += cur.rowcount
+                existing.add(rel)
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return added
 
 
@@ -7947,7 +7976,7 @@ def drive_worker():
             with _drive_inflight_lock:
                 active = len(_drive_inflight)
             parallel = max(1, min(DRIVE_MAX_PARALLEL, int(g.get("parallel_uploads") or 1)))
-            if now - drive_state["last_scan"] >= DRIVE_TICK:
+            if now - drive_state["last_scan"] >= DRIVE_SCAN_SEC:
                 drive_scan_once()
                 drive_state["last_scan"] = now
             if active < parallel:

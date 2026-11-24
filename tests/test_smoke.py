@@ -105,6 +105,12 @@ class ApiTests(_AppCase):
         cache_kb = self.m.db_conn().execute("PRAGMA cache_size").fetchone()[0]
         self.assertEqual(cache_kb, -512)
 
+    def test_db_wal_is_bounded_and_checkpointed(self):
+        conn = self.m.db_conn()
+        self.assertEqual(conn.execute("PRAGMA journal_size_limit").fetchone()[0], 67108864)
+        self.assertEqual(conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0], 1000)
+        self.m.db_checkpoint(truncate=True)
+
     def test_camera_lifecycle(self):
         payload = {"cam_id": "cam1", "name": "Cam", "brand": "custom",
                    "rtsp_url": "rtsp://127.0.0.1:1/x", "record_mode": "continuous"}
@@ -1291,6 +1297,7 @@ class ApiTests(_AppCase):
             self.assertGreaterEqual(self.m.drive_scan_once(), 1)
             self.assertEqual(self.m.drive_scan_once(), 0)
         conn = self.m.db_conn()
+        self.assertFalse(conn.in_transaction)
         self.assertIsNotNone(conn.execute("SELECT 1 FROM drive_uploads WHERE path=?",
                                           (f"{cam}/{old}",)).fetchone())
         self.assertIsNone(conn.execute("SELECT 1 FROM drive_uploads WHERE path=?",
