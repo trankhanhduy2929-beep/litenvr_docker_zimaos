@@ -43,7 +43,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.29").strip() or "1.9.29"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.30").strip() or "1.9.30"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -436,6 +436,10 @@ DEFAULT_CONFIG = {
         "with_photo": True,
         "telegram_clip": False,
         "telegram_clip_sec": 8,
+        "ntfy_enabled": False,
+        "ntfy_server": "https://ntfy.sh",
+        "ntfy_topic": "",
+        "ntfy_token": "",
         "disk_alert_enabled": False,
         "disk_warn_percent": 85,
         "disk_crit_percent": 95,
@@ -2808,7 +2812,7 @@ def camera_offline_state(cam_id: str) -> dict:
 
 
 def camera_offline_supervisor():
-    """Báo Telegram/webhook khi camera cần ghi hình mất kết nối quá lâu, báo lại khi hồi phục."""
+    """Báo Telegram/ntfy/webhook khi camera cần ghi hình mất kết nối quá lâu, báo lại khi hồi phục."""
     while not _shutdown.is_set():
         try:
             now = time.time()
@@ -3736,6 +3740,10 @@ class NotifySettings(BaseModel):
     with_photo: bool = True
     telegram_clip: bool = False
     telegram_clip_sec: int = 8
+    ntfy_enabled: bool = False
+    ntfy_server: str = "https://ntfy.sh"
+    ntfy_topic: str = ""
+    ntfy_token: str = ""             # Để trống khi lưu = giữ token cũ
     disk_alert_enabled: bool = False
     disk_warn_percent: float = 85
     disk_crit_percent: float = 95
@@ -4976,6 +4984,42 @@ def _capture_event_clip(cam_id: str, seconds: int) -> str:
         if proc and proc.poll() is None:
             _terminate_process(proc)
 
+_NTFY_TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+def _ntfy_norm_server(raw: Any) -> str:
+    server = str(raw or "").strip().rstrip("/")
+    if not server:
+        return "https://ntfy.sh"
+    if len(server) > 300:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(server)
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.query or parsed.fragment:
+        return ""
+    return server
+
+def _ntfy_send(server: str, topic: str, text: str, token: str = "", click: str = ""):
+    """Gửi push qua ntfy (server công khai hoặc tự dựng)."""
+    base = _ntfy_norm_server(server)
+    topic = str(topic or "").strip().strip("/")
+    if not base or not _NTFY_TOPIC_RE.fullmatch(topic):
+        raise ValueError("cấu hình ntfy thiếu server/topic hợp lệ")
+    headers = {"Title": "LiteNVR", "Priority": "3", "Tags": "bell"}
+    token = str(token or "").strip()
+    if token:
+        if "\r" in token or "\n" in token:
+            raise ValueError("token ntfy không hợp lệ")
+        headers["Authorization"] = f"Bearer {token}"
+    if click:
+        headers["Click"] = urllib.parse.quote(click, safe=":/?&=#%+,")
+    req = urllib.request.Request(f"{base}/{urllib.parse.quote(topic, safe='')}",
+                                 data=str(text or "")[:4000].encode("utf-8"),
+                                 method="POST", headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as response:
+        return response.read(300).decode("utf-8", "replace")
+
 def _notify_schedule_allows(now: Optional[datetime] = None) -> bool:
     """Kiểm tra khung giờ nhận thông báo chuyển động (giờ máy chủ)."""
     cfg = CONFIG.get("notify") or {}
@@ -5007,7 +5051,7 @@ def _notify_schedule_allows(now: Optional[datetime] = None) -> bool:
 
 def notify_motion(cam_id: str, label: str, snapshot_path: str = "",
                   event_id: Optional[int] = None, event_ts: Optional[int] = None):
-    """Mô tả AI + gửi thông báo Telegram/webhook (chạy trong thread riêng)."""
+    """Mô tả AI + gửi thông báo Telegram/ntfy/webhook (chạy trong thread riêng)."""
     cfg = CONFIG.get("notify") or {}
     ai_cfg = _ai_settings()
     in_schedule = _notify_schedule_allows()
@@ -5015,12 +5059,14 @@ def notify_motion(cam_id: str, label: str, snapshot_path: str = "",
                          and cfg.get("telegram_chat_id"))
     tg_on = bool(tg_configured and in_schedule)
     wh = (cfg.get("webhook_url") or "").strip() if in_schedule else ""
+    ntfy_on = bool(cfg.get("ntfy_enabled") and (cfg.get("ntfy_topic") or "").strip()
+                   and in_schedule)
     ai_on = bool(ai_cfg.get("enabled"))
     needs_license = tg_on or ai_on
     licensed = _license_gate("Thông báo Telegram/Mô tả AI") if needs_license else True
     tg_on = bool(tg_on and licensed)
     ai_on = bool(ai_on and licensed)
-    if not tg_on and not wh and not ai_on:
+    if not tg_on and not wh and not ntfy_on and not ai_on:
         return
     now = time.time()
     with _notify_lock:
@@ -5074,6 +5120,13 @@ def notify_motion(cam_id: str, label: str, snapshot_path: str = "",
             urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             log_event("warn", f"Webhook thông báo lỗi: {e}", cam_id)
+
+    if ntfy_on:
+        try:
+            _ntfy_send(cfg.get("ntfy_server") or "", cfg.get("ntfy_topic") or "",
+                       text, token=cfg.get("ntfy_token") or "", click=link)
+        except Exception as e:
+            log_event("warn", f"ntfy thông báo lỗi: {mask_secrets(str(e))}", cam_id)
 
     if tg_on:
         clip = ""
@@ -5133,7 +5186,7 @@ def _start_notify_thread(cam_id: str, label: str, snapshot_path: str,
 
 
 def send_alert(text: str):
-    """Gửi cảnh báo hệ thống (ổ đĩa...) qua Telegram/webhook đã cấu hình."""
+    """Gửi cảnh báo hệ thống (ổ đĩa...) qua Telegram/ntfy/webhook đã cấu hình."""
     cfg = CONFIG.get("notify") or {}
     wh = (cfg.get("webhook_url") or "").strip()
     if wh:
@@ -5145,6 +5198,12 @@ def send_alert(text: str):
             urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             log_event("warn", f"Webhook cảnh báo lỗi: {e}")
+    if cfg.get("ntfy_enabled") and (cfg.get("ntfy_topic") or "").strip():
+        try:
+            _ntfy_send(cfg.get("ntfy_server") or "", cfg.get("ntfy_topic") or "", text,
+                       token=cfg.get("ntfy_token") or "")
+        except Exception as e:
+            log_event("warn", f"ntfy cảnh báo lỗi: {mask_secrets(str(e))}")
     if cfg.get("telegram_enabled") and cfg.get("telegram_token") and cfg.get("telegram_chat_id"):
         try:
             _telegram_send(cfg["telegram_token"], str(cfg["telegram_chat_id"]), text)
@@ -6650,6 +6709,10 @@ def get_notify_settings():
         "with_photo": bool(nt.get("with_photo", True)),
         "telegram_clip": bool(nt.get("telegram_clip", False)),
         "telegram_clip_sec": int(nt.get("telegram_clip_sec") or 8),
+        "ntfy_enabled": bool(nt.get("ntfy_enabled", False)),
+        "ntfy_server": _ntfy_norm_server(nt.get("ntfy_server")) or "https://ntfy.sh",
+        "ntfy_topic": nt.get("ntfy_topic", ""),
+        "has_ntfy_token": bool((nt.get("ntfy_token") or "").strip()),
         "disk_alert_enabled": bool(nt.get("disk_alert_enabled", False)),
         "disk_warn_percent": float(nt.get("disk_warn_percent", 85) or 85),
         "disk_crit_percent": float(nt.get("disk_crit_percent", 95) or 95),
@@ -6670,6 +6733,20 @@ def update_notify_settings(settings: NotifySettings):
     nt["with_photo"] = settings.with_photo
     nt["telegram_clip"] = settings.telegram_clip
     nt["telegram_clip_sec"] = max(3, min(20, int(settings.telegram_clip_sec or 8)))
+    ntfy_server = _ntfy_norm_server(settings.ntfy_server)
+    ntfy_topic = (settings.ntfy_topic or "").strip().strip("/")
+    if not ntfy_server:
+        raise HTTPException(status_code=400, detail="Máy chủ ntfy phải bắt đầu bằng http:// hoặc https://")
+    if ntfy_topic and not _NTFY_TOPIC_RE.fullmatch(ntfy_topic):
+        raise HTTPException(status_code=400,
+                            detail="Topic ntfy chỉ gồm chữ, số, _ và - (tối đa 64 ký tự)")
+    if settings.ntfy_enabled and not ntfy_topic:
+        raise HTTPException(status_code=400, detail="Cần nhập topic ntfy khi bật push")
+    nt["ntfy_enabled"] = settings.ntfy_enabled
+    nt["ntfy_server"] = ntfy_server
+    nt["ntfy_topic"] = ntfy_topic
+    if settings.ntfy_token.strip():
+        nt["ntfy_token"] = settings.ntfy_token.strip()
     nt["disk_alert_enabled"] = settings.disk_alert_enabled
     nt["disk_warn_percent"] = float(settings.disk_warn_percent or 85)
     nt["disk_crit_percent"] = float(settings.disk_crit_percent or 95)
@@ -6703,8 +6780,16 @@ def test_notify():
             results["webhook"] = "ok"
         except Exception as e:
             results["webhook"] = f"lỗi: {e}"
+    if nt.get("ntfy_enabled") and (nt.get("ntfy_topic") or "").strip():
+        try:
+            _ntfy_send(nt.get("ntfy_server") or "", nt.get("ntfy_topic") or "",
+                       "✅ LiteNVR: thông báo thử nghiệm — cấu hình ntfy hoạt động!",
+                       token=nt.get("ntfy_token") or "")
+            results["ntfy"] = "ok"
+        except Exception as e:
+            results["ntfy"] = f"lỗi: {e}"
     if not results:
-        raise HTTPException(status_code=400, detail="Chưa bật Telegram và chưa có Webhook URL")
+        raise HTTPException(status_code=400, detail="Chưa bật Telegram, ntfy và chưa có Webhook URL")
     return {"status": "ok", "results": results}
 
 # ---------------- Mô tả sự kiện bằng AI ----------------

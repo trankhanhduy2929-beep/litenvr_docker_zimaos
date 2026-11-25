@@ -3378,7 +3378,7 @@
       </div>
       <hr style="border:0; border-top:1px solid var(--border-subtle); margin:18px 0 12px;">
       <h4 style="margin:0 0 8px;">💾 Sao lưu / Khôi phục toàn bộ cấu hình</h4>
-      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Bao gồm camera, lịch ghi hình, Home Assistant, thông báo Telegram/Webhook.</div>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Bao gồm camera, lịch ghi hình, Home Assistant, thông báo Telegram/ntfy/Webhook.</div>
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
         <button onclick="window.location='api/config/export'">⬇️ Xuất cấu hình (.json)</button>
         <button onclick="document.getElementById('restoreFile').click()">⬆️ Nhập cấu hình</button>
@@ -3621,6 +3621,27 @@
         </label>
         <input type="number" id="ntClipSec" min="3" max="20" step="1" value="8" title="Độ dài video (giây)">
       </div>
+      <hr style="border:0; border-top:1px solid var(--border-subtle); margin:14px 0 12px;">
+      <h4 style="margin:0 0 8px;">📱 Push ntfy</h4>
+      <label class="log-chk" style="font-size:13px; margin-bottom:10px;">
+        <input type="checkbox" id="ntNtfyEnabled"> Bật push qua ntfy
+      </label>
+      <div class="form-row">
+        <label>Máy chủ ntfy:</label>
+        <input id="ntNtfyServer" placeholder="https://ntfy.sh">
+      </div>
+      <div class="form-row">
+        <label>Topic (kênh nhận tin):</label>
+        <input id="ntNtfyTopic" placeholder="VD: litenvr-8f3k2">
+      </div>
+      <div class="form-row">
+        <label>Access token (tùy chọn, cho server riêng hoặc topic bảo vệ):</label>
+        <input type="password" id="ntNtfyToken" placeholder="tk_...">
+      </div>
+      <div id="ntNtfyTokenHint" style="font-size:12px;color:var(--ok-text);margin:-6px 0 10px;"></div>
+      <div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:10px;">
+        Mở app ntfy và đăng ký cùng topic. Topic trên ntfy.sh là công khai; nên dùng tên khó đoán hoặc access token. Ngoài lịch nhận thông báo bên dưới, ntfy cũng tạm ẩn.
+      </div>
       <div class="form-row">
         <label>Webhook URL (tùy chọn - nhận POST JSON, dùng cho Node-RED/HASS/n8n):</label>
         <input id="ntWebhook" placeholder="http://...">
@@ -3638,14 +3659,14 @@
         <input type="checkbox" id="ntSchedEnabled"> Chỉ gửi thông báo trong các khung giờ bên dưới
       </label>
       <div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:8px;">
-        Ngoài khung giờ, LiteNVR vẫn ghi hình và lưu sự kiện; chỉ tạm ẩn Telegram/webhook. Giờ theo máy chủ.
+        Ngoài khung giờ, LiteNVR vẫn ghi hình và lưu sự kiện; chỉ tạm ẩn Telegram/ntfy/webhook. Giờ theo máy chủ.
       </div>
       <div id="ntSchedRows"></div>
       <button type="button" style="margin-bottom:10px;" onclick="addNotifySchedRow()">+ Thêm khung giờ</button>
       <hr style="border:0; border-top:1px solid var(--border-subtle); margin:14px 0 12px;">
       <h4 style="margin:0 0 8px;">💽 Cảnh báo sức khoẻ ổ đĩa</h4>
       <label class="log-chk" style="font-size:13px; margin-bottom:10px;">
-        <input type="checkbox" id="ntDiskAlert"> Bật cảnh báo khi ổ đĩa sắp đầy (qua Telegram/webhook)
+        <input type="checkbox" id="ntDiskAlert"> Bật cảnh báo khi ổ đĩa sắp đầy (qua Telegram/ntfy/webhook)
       </label>
       <div class="grid-2">
         <div class="form-row">
@@ -3678,7 +3699,7 @@
         <a id="licPortalLink" href="https://litenvr-license.vercel.app" target="_blank" rel="noopener">https://litenvr-license.vercel.app</a>
       </div>
       <div style="font-size:12px;color:var(--text-muted);line-height:1.55;margin-bottom:12px;">
-        Telegram và mô tả sự kiện AI cần license còn hiệu lực.
+        Telegram và mô tả sự kiện AI cần license còn hiệu lực; ntfy và webhook miễn phí.
       </div>
       <div id="licStatus" style="font-size:13px;line-height:1.6;margin-bottom:12px;"></div>
       <div class="form-row">
@@ -7586,7 +7607,7 @@
       }
     }
 
-    // ================= Thông báo (Telegram/Webhook) =================
+    // ================= Thông báo (Telegram/ntfy/Webhook) =================
     function addNotifySchedRow(w) {
       w = w || {};
       const days = (w.days || []).map(d => d + 1).join(",");
@@ -7621,6 +7642,11 @@
       document.getElementById("ntPhoto").checked = cfg.with_photo !== false;
       document.getElementById("ntClip").checked = !!cfg.telegram_clip;
       document.getElementById("ntClipSec").value = cfg.telegram_clip_sec || 8;
+      document.getElementById("ntNtfyEnabled").checked = !!cfg.ntfy_enabled;
+      document.getElementById("ntNtfyServer").value = cfg.ntfy_server || "https://ntfy.sh";
+      document.getElementById("ntNtfyTopic").value = cfg.ntfy_topic || "";
+      document.getElementById("ntNtfyToken").value = "";
+      document.getElementById("ntNtfyTokenHint").textContent = cfg.has_ntfy_token ? "✔ Đã lưu token (để trống khi lưu = giữ nguyên)" : "";
       document.getElementById("ntWebhook").value = cfg.webhook_url || "";
       document.getElementById("ntPublicUrl").value = cfg.public_url || "";
       document.getElementById("ntSchedEnabled").checked = !!cfg.notify_schedule_enabled;
@@ -7665,6 +7691,10 @@
         with_photo: document.getElementById("ntPhoto").checked,
         telegram_clip: document.getElementById("ntClip").checked,
         telegram_clip_sec: parseInt(document.getElementById("ntClipSec").value) || 8,
+        ntfy_enabled: document.getElementById("ntNtfyEnabled").checked,
+        ntfy_server: document.getElementById("ntNtfyServer").value.trim(),
+        ntfy_topic: document.getElementById("ntNtfyTopic").value.trim(),
+        ntfy_token: document.getElementById("ntNtfyToken").value.trim(),
         camera_offline_alert: document.getElementById("ntCamOffline").checked,
         disk_alert_enabled: document.getElementById("ntDiskAlert").checked,
         disk_warn_percent: parseFloat(document.getElementById("ntDiskWarn").value) || 85,

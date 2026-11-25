@@ -97,7 +97,7 @@ POST /api/ai/detect
 - `snapshot_url` (tuỳ chọn): LiteNVR tải ảnh này làm ảnh sự kiện (bỏ qua chụp từ luồng); chỉ nhận `http/https`, tối đa 8 MB. Không có thì tự chụp như sự kiện chuyển động thường.
 - `label` (tuỳ chọn): ghi đè nhãn.
 - `bbox` (tuỳ chọn): `[x1,y1,x2,y2]` chuẩn hoá `0..1`, dùng để lọc **vùng chuyển động (ROI)** của camera. Không gửi `bbox` thì sự kiện vẫn được nhận (tránh mất báo từ cảm biến HA đời cũ).
-Sự kiện AI đi đúng luồng cũ: kích hoạt ghi hình, lưu vào danh sách sự kiện (tìm kiếm được theo nhãn/camera/ngày) và gửi thông báo (Telegram/webhook) nếu đã bật. Endpoint dùng chung quyền `live` nên client HTTP Basic (script/HA/Frigate) gọi được.
+Sự kiện AI đi đúng luồng cũ: kích hoạt ghi hình, lưu vào danh sách sự kiện (tìm kiếm được theo nhãn/camera/ngày) và gửi thông báo (Telegram/ntfy/webhook) nếu đã bật. Endpoint dùng chung quyền `live` nên client HTTP Basic (script/HA/Frigate) gọi được.
 
 ## Mô tả sự kiện bằng AI (Gemini / OpenAI / Groq / custom)
 
@@ -109,7 +109,7 @@ Mở **Cài đặt → Mô tả sự kiện AI**, bật tính năng rồi chọn
 
 Dán API key, model và base URL nếu cần. Mỗi snapshot chuyển động được gửi tới AI để tạo
 mô tả tiếng Việt (người, xe, màu áo, hành động…). Mô tả hiện dưới ảnh sự kiện, trong
-chi tiết, trong Telegram/webhook và **tìm được bằng ô tìm kiếm sự kiện**. Nút
+chi tiết, trong Telegram/ntfy/webhook và **tìm được bằng ô tìm kiếm sự kiện**. Nút
 **Check AI** gọi thử API key, Base URL và model đang nhập trước khi lưu; nút
 **Thử với snapshot mới nhất** kiểm tra bằng ảnh thật. Ảnh gửi tối đa 8 MB.
 Cấu hình cũ dùng model đã ngừng hỗ trợ (`gemini-2.0-flash`,
@@ -117,7 +117,7 @@ Cấu hình cũ dùng model đã ngừng hỗ trợ (`gemini-2.0-flash`,
 mới khi vẫn dùng Base URL gốc của nhà cung cấp.
 
 Tính năng AI và thông báo Telegram cần **license LiteNVR Pro** còn hiệu lực. Webhook
-JSON vẫn miễn phí. Vào **Cài đặt → Bản quyền**, mở link mua/quản lý license rồi dán
+JSON và ntfy vẫn miễn phí. Vào **Cài đặt → Bản quyền**, mở link mua/quản lý license rồi dán
 key; addon kiểm tra lại mỗi 6 giờ và cho phép dùng ngoại tuyến tối đa 7 ngày.
 
 Mã nguồn trang bán/kích hoạt license (Next.js + Cloudflare D1, deploy Vercel + Workers) nằm trong
@@ -170,7 +170,7 @@ Nguyên nhân phổ biến: camera dùng **H.265/HEVC** — trình duyệt (Chro
 - **Chụp snapshot có kiểm soát**: tối đa **2 ffmpeg chụp ảnh** chạy song song toàn hệ thống và **1 mỗi camera** (gộp yêu cầu trùng), tự dừng sau 12 giây nếu treo. Tránh dồn nhiều ffmpeg mở luồng cùng lúc khi có sự kiện chuyển động liên tục.
 - **Preset transcode nhẹ**: `ultrafast` + 1 luồng cho live H.265, `zerolatency`.
 - **Đệm Motion trong RAM**: tắt tuỳ chọn "Đệm chuyển động trong RAM" trong **⚙️ Lưu trữ** để ghi đệm ra đĩa nếu box ít RAM.
-- **Giới hạn thông báo đồng thời**: AI/Telegram/webhook chạy tối đa `NOTIFY_MAX_CONCURRENT` luồng cùng lúc (mặc định `4`, kẹp tối thiểu `1`). Khi có quá nhiều chuyển động dồn dập, sự kiện vượt giới hạn được bỏ qua và ghi cảnh báo tối đa mỗi phút, tránh giữ nhiều ảnh/base64 trong RAM cùng lúc.
+- **Giới hạn thông báo đồng thời**: AI/Telegram/ntfy/webhook chạy tối đa `NOTIFY_MAX_CONCURRENT` luồng cùng lúc (mặc định `4`, kẹp tối thiểu `1`). Khi có quá nhiều chuyển động dồn dập, sự kiện vượt giới hạn được bỏ qua và ghi cảnh báo tối đa mỗi phút, tránh giữ nhiều ảnh/base64 trong RAM cùng lúc.
 - **Giảm phân mảnh RAM của app**: image đặt `MALLOC_ARENA_MAX=2`; tiến trình dọn RAM gọi `malloc_trim` mỗi 60 giây để trả bộ nhớ đệm của glibc về hệ điều hành. Đây là bộ nhớ đã cấp phát cho app, không phải page cache của video.
 - **HLS độ trễ thấp**: live dùng segment **1 giây**, playlist **4 segment** và trình duyệt bắt đầu gần live edge; ffmpeg ép keyframe đúng nhịp segment khi phải chuyển mã. Đổi bằng `LIVE_HLS_TIME` (mặc định `1`, kẹp 1–10) và `LIVE_HLS_LIST` (mặc định `4`, kẹp 3–20). Mạng Wi-Fi yếu hoặc camera có GOP dài có thể tăng lên `LIVE_HLS_TIME=2`, `LIVE_HLS_LIST=5`; HLS vẫn có độ trễ nền khoảng 1–4 giây tuỳ camera. Nếu đặt sau reverse proxy, tắt proxy buffering cho `/hls/`.
 - **Thấy LiteNVR "ăn" ~2GB RAM?** Phần lớn thường là **bộ đệm file (page cache)** của Linux khi ghi/đọc video liên tục — nó hiện trong số RAM của container nhưng **tự nhả khi máy cần**, không phải rò rỉ. Mở **Dashboard** (hoặc `GET /api/system` → mục `memory`) để xem chi tiết: `app_rss_mb` (app), `app_anon_mb` (bộ nhớ ẩn danh thực của app), `app_file_mb` (phần file-backed), `app_peak_mb` (đỉnh RSS từ lúc khởi động), `app_threads` (số luồng), `notify_active`/`notify_limit` (thông báo đang chạy), `children_mb` (ffmpeg/go2rtc), `cgroup_file_mb` (cache — bình thường), `cgroup_shmem_mb` (đệm RAM/HLS). Nếu `app_anon_mb` tăng liên tục qua nhiều giờ thì mới là rò rỉ; nếu chỉ `app_peak_mb` cao mà `app_anon_mb` thấp thì app đã trả bộ nhớ và RSS đang phản ánh đỉnh cũ. Mỗi tiến trình con trong `children` có thêm `role` (camera/snapshot/playback), `cam_id`, `threads`, `age_sec` và `peak_rss_mb` để biết ffmpeg nào đang tốn RAM. Muốn hạ: dùng luồng phụ H.264 cho live, `GO2RTC=off/on` phù hợp, và tắt "Đệm chuyển động trong RAM" nếu cần.
@@ -188,7 +188,7 @@ Nguyên nhân phổ biến: camera dùng **H.265/HEVC** — trình duyệt (Chro
 - **CPU** hiển thị % toàn hệ thống và %CPU riêng của từng tiến trình ffmpeg (dưới mỗi camera).
 - **RAM / Bộ nhớ** có thanh màu đổi theo mức (xanh → cam ≥75% → đỏ ≥90%).
 - **Sức khoẻ luồng**: ffmpeg báo tiến độ (`-progress`), LiteNVR hiển thị **fps** từng camera; nếu không có khung mới trong 20 giây thì đánh dấu **⏸ đứng** và tự khởi động lại luồng. Xem qua `GET /api/stats`/`/api/system` (mục `cam_health`: `fps`, `stalled`, `state`, `age_sec`).
-- **Sức khoẻ ổ đĩa**: `GET /api/disk_health` (và trong `/api/system`) trả về dung lượng, **inode**, quyền ghi và **SMART** (nhiệt độ/health nếu có `smartctl` — thường không có trong container, khi đó ghi rõ "không khả dụng"). Trong 🔔 **Thông báo** có thể bật **cảnh báo ổ đĩa sắp đầy**: vượt ngưỡng cảnh báo/nguy hiểm sẽ gửi Telegram/webhook (báo lại tối đa mỗi 6 giờ khi vẫn vượt).
+- **Sức khoẻ ổ đĩa**: `GET /api/disk_health` (và trong `/api/system`) trả về dung lượng, **inode**, quyền ghi và **SMART** (nhiệt độ/health nếu có `smartctl` — thường không có trong container, khi đó ghi rõ "không khả dụng"). Trong 🔔 **Thông báo** có thể bật **cảnh báo ổ đĩa sắp đầy**: vượt ngưỡng cảnh báo/nguy hiểm sẽ gửi Telegram/ntfy/webhook (báo lại tối đa mỗi 6 giờ khi vẫn vượt).
 - Lưới **camera trực quan**: ô camera hiện ảnh chuyển động mới nhất, chế độ (24/7 / Motion / Live / Lịch), bấm để chuyển nhanh.
 - Trên bản ghi liên tục, các **khoảng có chuyển động được tô màu cam** trên thanh thời gian để dễ dò lại đúng đoạn.
 - **Ảnh sự kiện**: mỗi sự kiện chuyển động hiện kèm **ảnh snapshot** (thumbnail trong danh sách). Nếu hai ffmpeg chụp ảnh đang bận, sự kiện vẫn dùng **ảnh mới nhất** của camera làm dự phòng nên không bị thiếu ảnh.
@@ -205,8 +205,9 @@ Nguyên nhân phổ biến: camera dùng **H.265/HEVC** — trình duyệt (Chro
 - **📅 Lịch ghi hình**: trong phần sửa camera, bật **Lịch ghi hình** và thêm các khung giờ (Thứ, Từ, Đến, chế độ 24/7 hay Motion). Ngoài mọi khung giờ, camera **không ghi** (vẫn xem live được). Hỗ trợ khung giờ qua đêm (VD 22:00 → 06:00). Ví dụ: ngày thường chỉ Motion 8h–17h, ban đêm 24/7.
 - **🎯 Vùng chuyển động (ROI)**: trong **Tùy chọn nâng cao** của camera, bấm **↻ Tải ảnh hiện tại** rồi kéo chuột để vẽ vùng; có thể chỉnh X/Y/rộng/cao theo % hoặc xoá từng vùng. Chỉ sự kiện có **tâm bbox** nằm trong vùng mới kích hoạt ghi hình/thông báo. API `/api/motion` và `/api/ai/detect` nhận thêm `bbox` dạng `[x1,y1,x2,y2]` (0..1); cảm biến HA không có toạ độ sẽ **bỏ qua bộ lọc** để không mất báo.
 - **🎮 PTZ (ONVIF)**: bấm **🎮 PTZ** để hiện bàn điều hướng xoay/zoom (dùng tài khoản trong URL RTSP; camera cần hỗ trợ ONVIF). Chọn preset có sẵn trong danh sách và bấm **📍 Đến preset**. Nếu camera dùng cổng ONVIF khác 80, thêm `onvif_port` trong `config.json`.
-- **Thông báo Telegram/Webhook**: bấm **Thông báo**, dán **Bot Token** (tạo bot qua @BotFather), **Chat ID** và bật thông báo — mỗi khi có chuyển động, LiteNVR gửi tin kèm **ảnh snapshot** hoặc **video ngắn** (tuỳ chọn) và mô tả AI nếu đã bật. Ô **Webhook URL** cho phép đẩy JSON sang Node-RED/HA/n8n (miễn phí). Nút **Gửi thử** để kiểm tra; tin nhắn giới hạn 1 tin/3 giây mỗi camera để tránh dội. Điền **Địa chỉ LiteNVR** (VD `http://192.168.5.63:9895`) để tin nhắn/webhook kèm **link Xem lại** mở đúng camera + thời điểm sự kiện (giao diện tự đọc `?cam=&date=&t=`). Telegram cần license Pro còn hiệu lực.
-- **🕒 Lịch nhận thông báo**: trong hộp thoại **Thông báo**, bật **Chỉ gửi thông báo trong các khung giờ bên dưới** và thêm khung giờ theo Thứ/Từ/Đến (hỗ trợ qua đêm). Ngoài khung giờ, LiteNVR **vẫn ghi hình và lưu sự kiện**, chỉ tạm ẩn Telegram/webhook; cảnh báo sức khoẻ ổ đĩa và camera offline không bị ẩn.
+- **Thông báo Telegram/ntfy/Webhook**: bấm **Thông báo**, dán **Bot Token** (tạo bot qua @BotFather), **Chat ID** và bật thông báo — mỗi khi có chuyển động, LiteNVR gửi tin kèm **ảnh snapshot** hoặc **video ngắn** (tuỳ chọn) và mô tả AI nếu đã bật. Ô **Webhook URL** cho phép đẩy JSON sang Node-RED/HA/n8n (miễn phí). Nút **Gửi thử** để kiểm tra; tin nhắn giới hạn 1 tin/3 giây mỗi camera để tránh dội. Điền **Địa chỉ LiteNVR** (VD `http://192.168.5.63:9895`) để tin nhắn/webhook kèm **link Xem lại** mở đúng camera + thời điểm sự kiện (giao diện tự đọc `?cam=&date=&t=`). Telegram cần license Pro còn hiệu lực.
+- **📱 Push ntfy (miễn phí)**: bật **Push ntfy** trong hộp thoại **Thông báo**, nhập máy chủ (mặc định `https://ntfy.sh`), **topic** và access token nếu server riêng/topic bảo vệ. Mở app ntfy và đăng ký cùng topic để nhận tin kèm link xem lại. Topic trên `ntfy.sh` là công khai — nên dùng tên khó đoán hoặc token. Nút **Gửi thử** kiểm tra cả ntfy.
+- **🕒 Lịch nhận thông báo**: trong hộp thoại **Thông báo**, bật **Chỉ gửi thông báo trong các khung giờ bên dưới** và thêm khung giờ theo Thứ/Từ/Đến (hỗ trợ qua đêm). Ngoài khung giờ, LiteNVR **vẫn ghi hình và lưu sự kiện**, chỉ tạm ẩn Telegram/ntfy/webhook; cảnh báo sức khoẻ ổ đĩa và camera offline không bị ẩn.
 - **💾 Sao lưu / Khôi phục cấu hình**: trong **⚙️ Lưu trữ**, bấm **Xuất cấu hình** để tải file JSON (camera, lịch, HA, thông báo) và **Nhập cấu hình** để khôi phục sau khi chạy container mới / khôi phục nguyên trạng.
 - **📱 Tối ưu điện thoại / máy tính bảng**: giao diện tự gọn thanh công cụ thành nút **☰** trên màn hình nhỏ, modal mở toàn màn hình, nút/ô nhập đủ lớn cho cảm ứng (ô nhập ≥16px, chống iOS tự phóng to), timeline cao hơn để kéo tua dễ hơn.
 

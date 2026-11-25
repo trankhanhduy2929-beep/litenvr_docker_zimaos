@@ -610,6 +610,98 @@ class ApiTests(_AppCase):
             self.m.CONFIG["notify"] = saved
             self.m._notify_last.pop("schedcam", None)
 
+    def test_ntfy_settings_persist_and_hide_token(self):
+        saved = self.m.CONFIG.get("notify")
+        try:
+            r = self.client.post("/api/notify", json={
+                "ntfy_enabled": True,
+                "ntfy_server": "https://ntfy.example.com/",
+                "ntfy_topic": "litenvr_test",
+                "ntfy_token": "tk_secret_value",
+            }, headers=auth())
+            self.assertEqual(r.status_code, 200, r.text)
+            j = self.client.get("/api/notify", headers=auth()).json()
+            self.assertTrue(j["ntfy_enabled"])
+            self.assertEqual(j["ntfy_server"], "https://ntfy.example.com")
+            self.assertEqual(j["ntfy_topic"], "litenvr_test")
+            self.assertTrue(j["has_ntfy_token"])
+            self.assertNotIn("tk_secret_value", json.dumps(j))
+            self.assertEqual(self.m.CONFIG["notify"]["ntfy_token"], "tk_secret_value")
+            self.assertEqual(self.client.post("/api/notify", json={
+                "ntfy_enabled": True, "ntfy_topic": "bad topic!"}, headers=auth()).status_code, 400)
+            self.assertEqual(self.client.post("/api/notify", json={
+                "ntfy_enabled": False, "ntfy_server": "ftp://bad"}, headers=auth()).status_code, 400)
+        finally:
+            self.m.CONFIG["notify"] = saved
+
+    def test_ntfy_send_and_schedule_gate(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, *args):
+                return b"ok"
+
+        def fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.header_items())
+            captured["body"] = req.data
+            return FakeResponse()
+
+        with mock.patch.object(self.m.urllib.request, "urlopen", fake_urlopen):
+            self.m._ntfy_send("https://ntfy.example.com/", "topic_1", "Xin chào",
+                              token="tk_secret", click="http://nvr.local/?cam=a&t=1")
+        self.assertEqual(captured["url"], "https://ntfy.example.com/topic_1")
+        self.assertEqual(captured["body"].decode(), "Xin chào")
+        self.assertEqual(captured["headers"].get("Authorization"), "Bearer tk_secret")
+        self.assertEqual(captured["headers"].get("Click"), "http://nvr.local/?cam=a&t=1")
+
+        saved = self.m.CONFIG.get("notify")
+        self.m.CONFIG["notify"] = {
+            "ntfy_enabled": True,
+            "ntfy_server": "https://ntfy.example.com",
+            "ntfy_topic": "topic_1",
+            "ntfy_token": "",
+            "with_photo": False,
+        }
+        try:
+            with mock.patch.object(self.m, "_notify_schedule_allows", return_value=False), \
+                    mock.patch.object(self.m, "_ntfy_send") as send:
+                self.m.notify_motion("ntfycam", "test")
+                send.assert_not_called()
+            with mock.patch.object(self.m, "_notify_schedule_allows", return_value=True), \
+                    mock.patch.object(self.m, "_ntfy_send") as send:
+                self.m.notify_motion("ntfycam", "test")
+                send.assert_called_once()
+            with mock.patch.object(self.m, "_ntfy_send") as send:
+                self.m.send_alert("ổ đĩa đầy")
+                send.assert_called_once()
+        finally:
+            self.m.CONFIG["notify"] = saved
+            self.m._notify_last.pop("ntfycam", None)
+
+    def test_notify_test_endpoint_sends_ntfy(self):
+        saved = self.m.CONFIG.get("notify")
+        self.m.CONFIG["notify"] = {
+            "ntfy_enabled": True,
+            "ntfy_server": "https://ntfy.example.com",
+            "ntfy_topic": "topic_1",
+            "ntfy_token": "",
+        }
+        try:
+            with mock.patch.object(self.m, "_ntfy_send") as send:
+                r = self.client.post("/api/notify/test", headers=auth())
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["results"]["ntfy"], "ok")
+            send.assert_called_once()
+        finally:
+            self.m.CONFIG["notify"] = saved
+
     def test_notify_threads_are_capped(self):
         deadline = time.time() + 2
         while self.m._notify_active and time.time() < deadline:
