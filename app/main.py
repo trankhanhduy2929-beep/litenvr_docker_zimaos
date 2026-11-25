@@ -42,7 +42,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.25").strip() or "1.9.25"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.26").strip() or "1.9.26"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -3364,6 +3364,21 @@ def cam_retention_days(cam_id: str) -> float:
     return v if v > 0 else float(CONFIG.get("retention_days", 7))
 
 
+def _disk_pressure() -> bool:
+    """Ổ đang vượt ngưỡng cứng: được phép dọn cả file chưa tải lên Drive."""
+    try:
+        total, used, _ = shutil.disk_usage(STORAGE_DIR)
+    except OSError:
+        return False
+    if not total:
+        return False
+    used_pct = used / total * 100
+    free_pct = 100.0 - used_pct
+    max_pct = float(CONFIG.get("max_disk_percent", 85) or 0)
+    min_free = float(CONFIG.get("min_free_percent", 3) or 0)
+    return (max_pct > 0 and used_pct > max_pct) or (min_free > 0 and free_pct < min_free)
+
+
 def run_cleanup_now():
     retention_days = float(CONFIG.get("retention_days", 7))
     max_storage_gb = float(CONFIG.get("max_storage_gb", 0))
@@ -3371,16 +3386,19 @@ def run_cleanup_now():
     deleted_count = 0
     locked = locked_paths()
     drive_pending = _drive_pending_paths()
+    disk_pressure = _disk_pressure()
     now = time.time()
 
-    def _protected(fp: str) -> bool:
+    def _protected(fp: str, allow_drive_eviction: bool = False) -> bool:
         try:
             rel = os.path.relpath(fp, RECORDINGS_DIR)
             if not rel.startswith(".."):
-                if rel in locked or rel in drive_pending:
+                if rel in locked:
                     return True
                 if now - os.path.getmtime(fp) < 60:
                     return True  # ffmpeg vừa ghi xong, tránh xoá segment đang mở
+                if rel in drive_pending and not allow_drive_eviction:
+                    return True
             return rel in locked
         except Exception:
             return True
@@ -3410,7 +3428,7 @@ def run_cleanup_now():
             for file in files:
                 fp = os.path.join(root, file)
                 try:
-                    if _protected(fp):
+                    if _protected(fp, allow_drive_eviction=disk_pressure):
                         continue
                     all_media.append((os.path.getmtime(fp), os.path.getsize(fp), fp))
                 except Exception:
@@ -3428,10 +3446,23 @@ def run_cleanup_now():
 
         if not (over_gb or over_pct):
             break
+        rel = os.path.relpath(fp, RECORDINGS_DIR)
+        drive_evict = disk_pressure and not rel.startswith("..") and rel in drive_pending
         try:
             os.remove(fp)
             media_bytes -= fsize
             deleted_count += 1
+            if drive_evict:
+                log_event("warn", f"Ổ đĩa đầy: xoá bản ghi chưa tải lên Drive để giải phóng chỗ: {rel}")
+                try:
+                    conn = db_conn()
+                    conn.execute(
+                        "UPDATE drive_uploads SET status='skipped', error=?, updated=? "
+                        "WHERE path=? AND status IN ('pending','uploading','error')",
+                        ("đã xoá để giải phóng ổ đĩa", time.time(), rel))
+                    conn.commit()
+                except Exception as e:
+                    log_event("warn", f"cleanup drive state: {e}")
         except Exception:
             pass
 

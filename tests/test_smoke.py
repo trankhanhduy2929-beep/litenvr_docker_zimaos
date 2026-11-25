@@ -1388,18 +1388,73 @@ class ApiTests(_AppCase):
                      (f"{cam}/{names['pending']}", cam, names["pending"], old_ts, now))
         conn.commit()
         old_cfg = (self.m.CONFIG.get("retention_days"), self.m.CONFIG.get("max_storage_gb"),
-                   self.m.CONFIG.get("max_disk_percent"))
+                   self.m.CONFIG.get("max_disk_percent"), self.m.CONFIG.get("min_free_percent"))
         try:
             self.m.CONFIG["retention_days"] = 1
             self.m.CONFIG["max_storage_gb"] = 0
             self.m.CONFIG["max_disk_percent"] = 0
+            self.m.CONFIG["min_free_percent"] = 0
             self.m.run_cleanup_now()
         finally:
             self.m.CONFIG["retention_days"], self.m.CONFIG["max_storage_gb"], \
-                self.m.CONFIG["max_disk_percent"] = old_cfg
+                self.m.CONFIG["max_disk_percent"], self.m.CONFIG["min_free_percent"] = old_cfg
         self.assertFalse(os.path.exists(os.path.join(cam_dir, names["normal"])))
         for key in ("locked", "pending", "active"):
             self.assertTrue(os.path.exists(os.path.join(cam_dir, names[key])), key)
+
+    def test_cleanup_evicts_old_drive_pending_under_disk_pressure(self):
+        rec_dir = tempfile.mkdtemp(dir=self.sandbox)
+        snap_dir = tempfile.mkdtemp(dir=self.sandbox)
+        cam = "pressurecam"
+        cam_dir = os.path.join(rec_dir, cam)
+        os.makedirs(cam_dir)
+        old_name, new_name = "old.mp4", "new.mp4"
+        for name, mtime in ((old_name, 1000.0), (new_name, 2000.0)):
+            fp = os.path.join(cam_dir, name)
+            with open(fp, "wb") as f:
+                f.write(b"x")
+            os.utime(fp, (mtime, mtime))
+        conn = self.m.db_conn()
+        for name, ts in ((old_name, 1000), (new_name, 2000)):
+            conn.execute("INSERT OR REPLACE INTO drive_uploads "
+                         "(path, cam_id, name, ts, size, status, tries, next_try, updated) "
+                         "VALUES (?, ?, ?, ?, 1, 'pending', 0, 0, ?)",
+                         (f"{cam}/{name}", cam, name, ts, time.time()))
+        conn.commit()
+        old_cfg = (self.m.CONFIG.get("retention_days"), self.m.CONFIG.get("max_storage_gb"),
+                   self.m.CONFIG.get("max_disk_percent"), self.m.CONFIG.get("min_free_percent"))
+        calls = {"n": 0}
+
+        def fake_disk_usage(_path):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return (100.0, 86.0, 14.0)
+            return (100.0, 84.0, 16.0)
+
+        try:
+            self.m.CONFIG["retention_days"] = 0
+            self.m.CONFIG["max_storage_gb"] = 0
+            self.m.CONFIG["max_disk_percent"] = 85
+            self.m.CONFIG["min_free_percent"] = 0
+            with mock.patch.object(self.m, "RECORDINGS_DIR", rec_dir), \
+                    mock.patch.object(self.m, "SNAPSHOTS_DIR", snap_dir), \
+                    mock.patch.object(self.m.shutil, "disk_usage", side_effect=fake_disk_usage):
+                self.m.run_cleanup_now()
+            self.assertFalse(os.path.exists(os.path.join(cam_dir, old_name)))
+            self.assertTrue(os.path.exists(os.path.join(cam_dir, new_name)))
+            old_status = conn.execute("SELECT status FROM drive_uploads WHERE path=?",
+                                      (f"{cam}/{old_name}",)).fetchone()
+            new_status = conn.execute("SELECT status FROM drive_uploads WHERE path=?",
+                                      (f"{cam}/{new_name}",)).fetchone()
+            self.assertEqual(old_status["status"], "skipped")
+            self.assertEqual(new_status["status"], "pending")
+        finally:
+            self.m.CONFIG["retention_days"], self.m.CONFIG["max_storage_gb"], \
+                self.m.CONFIG["max_disk_percent"], self.m.CONFIG["min_free_percent"] = old_cfg
+            conn.execute("DELETE FROM drive_uploads WHERE cam_id=?", (cam,))
+            conn.commit()
+            shutil.rmtree(rec_dir, ignore_errors=True)
+            shutil.rmtree(snap_dir, ignore_errors=True)
 
 class MqttUnitTests(unittest.TestCase):
     @classmethod
