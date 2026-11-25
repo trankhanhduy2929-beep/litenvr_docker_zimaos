@@ -42,7 +42,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.24").strip() or "1.9.24"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.25").strip() or "1.9.25"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -1241,6 +1241,10 @@ LIVE_HLS_LIST = max(3, min(20, int(os.environ.get("LIVE_HLS_LIST", "4") or "4"))
 # Theo dõi cảnh báo đầy ổ (tránh spam log)
 _disk_warn = {"t": 0.0}
 _disk_paused = {"low": False}
+# Trạng thái đầy ổ có hysteresis: chỉ phục hồi khi trống vượt ngưỡng + 1%.
+# Tránh ghi hình bật/tắt liên tục khi dung lượng ổ dao động quanh đúng ngưỡng.
+_disk_low_state = {"low": False}
+_disk_low_lock = threading.Lock()
 
 
 def disk_low() -> bool:
@@ -1248,15 +1252,24 @@ def disk_low() -> bool:
     try:
         pct = float(CONFIG.get("min_free_percent", 3) or 0)
         if pct <= 0:
+            with _disk_low_lock:
+                _disk_low_state["low"] = False
             return False
+        with _disk_low_lock:
+            resume_margin = 1.0 if _disk_low_state["low"] else 0.0
+        threshold = pct + resume_margin
+        low = False
         for path in (STORAGE_DIR, BUFFER_DIR, HLS_DIR):
             try:
                 total, used, _ = shutil.disk_usage(path)
             except OSError:
                 continue
-            if total and ((total - used) / total) * 100 < pct:
-                return True
-        return False
+            if total and ((total - used) / total) * 100 < threshold:
+                low = True
+                break
+        with _disk_low_lock:
+            _disk_low_state["low"] = low
+        return low
     except Exception:
         return False
 # Lưu thời điểm kết thúc ghi hình chuyển động của từng camera (Unix timestamp)
@@ -2497,6 +2510,19 @@ def schedule_record_mode(cam_info: dict, now: Optional[datetime] = None) -> str:
             continue
     return "off"
 
+def _worker_modes(cam_info: dict, low: Optional[bool] = None):
+    """Chế độ ghi/live hiệu lực của worker.
+
+    Khi ổ gần đầy, worker vẫn được chạy để phục vụ live nhưng ghi hình bị tạm dừng.
+    Trả về (schedule_mode, record_mode, disk_low).
+    """
+    sched = schedule_record_mode(cam_info)
+    if low is None:
+        low = disk_low()
+    record_mode = sched if sched != "off" and not low else "off"
+    return sched, record_mode, bool(low)
+
+
 def mark_viewer(cam_id: str):
     """Đánh dấu có người đang xem live (heartbeat / tải segment HLS)."""
     with viewer_lock:
@@ -2759,8 +2785,8 @@ def _camera_worker_loop(cam_id: str, token: threading.Event):
         cam_info = CONFIG.get("cameras", {}).get(cam_id)
         if not cam_info:
             break
-        sched = schedule_record_mode(cam_info)
-        record_needed = sched != "off"
+        sched, rec_mode, low = _worker_modes(cam_info)
+        record_needed = rec_mode != "off"
         viewers = viewers_active(cam_id)
         if not record_needed and not viewers:
             st["stop_reason"] = "idle"
@@ -2775,7 +2801,8 @@ def _camera_worker_loop(cam_id: str, token: threading.Event):
         if token.is_set() or _shutdown.is_set():
             break
         eff_info = dict(cam_info)
-        eff_info["record_mode"] = sched if sched != "off" else "off"
+        eff_info["record_mode"] = rec_mode
+        st["_disk_live_only"] = bool(low and sched != "off" and viewers)
         if include_live:
             _clear_hls_playlist(cam_id)
         main_url, sub_url = cam_source_urls(cam_id, eff_info)
@@ -2972,9 +2999,12 @@ def ensure_live(cam_id: str):
     mark_viewer(cam_id)
     st = cam_status.setdefault(cam_id, {})
     now = time.time()
+    # Worker đã bị dừng (ví dụ do ổ đầy hoặc hết người xem) -> khởi động lại.
+    # Nếu ổ đang đầy, worker tự chạy chế độ live-only để không ghi hình.
+    if not st.get("running"):
+        start_camera_worker(cam_id)
+        return
     if schedule_record_mode(cam_info) == "off":
-        if not st.get("running"):
-            start_camera_worker(cam_id)
         return
     # Camera có ghi hình: nếu nhánh live đang tắt (tiết kiệm CPU) thì khởi động lại
     if st.get("_live_mode") is False and now - st.get("_mode_ts", 0) > 5:
@@ -2997,10 +3027,19 @@ def live_supervisor():
             for cam_id, cam in list(CONFIG.get("cameras", {}).items()):
                 st = cam_status.get(cam_id, {})
                 sched = schedule_record_mode(cam)
-                if low and st.get("running") and sched != "off":
-                    log_event("warn", "Tạm dừng ghi hình do ổ đĩa/tmpfs gần đầy", cam_id)
-                    stop_camera_worker(cam_id)
-                    st["_sched"] = sched
+                if low and sched != "off":
+                    # Ổ đầy: dừng nhánh ghi hình, nhưng vẫn giữ live cho người đang xem.
+                    # Worker tự chạy live-only khi thấy disk_low (xem _worker_modes).
+                    if st.get("running") and st.get("_disk_live_only") and not viewers_active(cam_id):
+                        log_event("info", f"Không có người xem {LIVE_IDLE_STOP_SEC}s, dừng live", cam_id)
+                        stop_camera_worker(cam_id)
+                        continue
+                    if st.get("running") and not st.get("_disk_live_only"):
+                        log_event("warn", "Tạm dừng ghi hình do ổ đĩa/tmpfs gần đầy", cam_id)
+                        stop_camera_worker(cam_id)
+                        st["_sched"] = sched
+                    if not st.get("running") and viewers_active(cam_id):
+                        start_camera_worker(cam_id)
                     continue
                 # Lịch đổi trạng thái (vào/ra khung giờ) -> khởi động lại worker theo chế độ mới
                 if st.get("_sched") != sched:
@@ -3008,6 +3047,7 @@ def live_supervisor():
                         log_event("info", f"Lịch ghi hình đổi sang '{sched}', áp dụng lại luồng", cam_id)
                         stop_camera_worker(cam_id)
                     if sched != "off" and not low:
+                        st["_disk_live_only"] = False
                         start_camera_worker(cam_id)
                     st["_sched"] = sched
                     continue
@@ -3019,16 +3059,24 @@ def live_supervisor():
                     elif st.get("running") and last and (now - last) > LIVE_IDLE_STOP_SEC:
                         log_event("info", f"Không có người xem {LIVE_IDLE_STOP_SEC}s, dừng live", cam_id)
                         stop_camera_worker(cam_id)
-                elif st.get("running") and st.get("_live_mode") is not None:
-                    desired = viewers_active(cam_id)
-                    if desired != st.get("_live_mode") and now - st.get("_mode_ts", 0) > 5:
-                        st["_mode_ts"] = now
-                        log_event("info", "Đổi nhánh live theo người xem (tiết kiệm CPU)", cam_id)
+                else:
+                    if st.get("_disk_live_only") and st.get("running"):
+                        st["_disk_live_only"] = False
+                        log_event("info", "Ổ đĩa hồi phục: bật lại ghi hình", cam_id)
                         proc = ffmpeg_processes.get(cam_id)
                         if proc and proc.poll() is None:
                             _restart_camera_process(cam_id, proc, immediate=True)
+                    elif st.get("running") and st.get("_live_mode") is not None:
+                        desired = viewers_active(cam_id)
+                        if desired != st.get("_live_mode") and now - st.get("_mode_ts", 0) > 5:
+                            st["_mode_ts"] = now
+                            log_event("info", "Đổi nhánh live theo người xem (tiết kiệm CPU)", cam_id)
+                            proc = ffmpeg_processes.get(cam_id)
+                            if proc and proc.poll() is None:
+                                _restart_camera_process(cam_id, proc, immediate=True)
                 # Hồi phục sau khi ổ đĩa hết đầy: khởi động lại ghi hình cho camera đang cần
                 if not low and sched != "off" and not st.get("running"):
+                    st["_disk_live_only"] = False
                     start_camera_worker(cam_id)
             disk = read_disk()
             thr = float(CONFIG.get("max_disk_percent", 85) or 0)

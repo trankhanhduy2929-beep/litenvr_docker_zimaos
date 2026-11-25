@@ -881,6 +881,50 @@ class ApiTests(_AppCase):
         self.assertIn("uptime_sec", sysinfo["host"])
         self.client.delete("/api/cameras/camGB", headers=auth())
 
+    def test_disk_low_uses_resume_hysteresis(self):
+        old_pct = self.m.CONFIG.get("min_free_percent")
+        self.m.CONFIG["min_free_percent"] = 15
+        self.m._disk_low_state["low"] = False
+        free_pct = {"v": 14.0}
+
+        def fake_disk_usage(_path):
+            return (100.0, 100.0 - free_pct["v"], free_pct["v"])
+
+        try:
+            with mock.patch.object(self.m.shutil, "disk_usage", side_effect=fake_disk_usage):
+                self.assertTrue(self.m.disk_low())
+                free_pct["v"] = 15.5
+                self.assertTrue(self.m.disk_low())
+                free_pct["v"] = 16.1
+                self.assertFalse(self.m.disk_low())
+                free_pct["v"] = 15.5
+                self.assertFalse(self.m.disk_low())
+        finally:
+            self.m.CONFIG["min_free_percent"] = old_pct
+            self.m._disk_low_state["low"] = False
+
+    def test_worker_modes_keep_live_but_pause_recording_when_disk_low(self):
+        self.assertEqual(self.m._worker_modes({"record_mode": "continuous"}, low=False),
+                         ("continuous", "continuous", False))
+        self.assertEqual(self.m._worker_modes({"record_mode": "continuous"}, low=True),
+                         ("continuous", "off", True))
+        self.assertEqual(self.m._worker_modes({"record_mode": "off"}, low=True),
+                         ("off", "off", True))
+
+    def test_ensure_live_starts_worker_when_stopped(self):
+        cam = "cam-ensure-live"
+        self.m.CONFIG.setdefault("cameras", {})[cam] = {
+            "name": cam, "rtsp_url": "rtsp://127.0.0.1:1/x", "record_mode": "continuous"}
+        self.m.cam_status[cam] = {"running": False}
+        try:
+            with mock.patch.object(self.m, "start_camera_worker") as start:
+                self.m.ensure_live(cam)
+            start.assert_called_once_with(cam)
+        finally:
+            self.m.CONFIG["cameras"].pop(cam, None)
+            self.m.cam_status.pop(cam, None)
+            self.m.cam_viewers.pop(cam, None)
+
     def test_session_list_and_revoke(self):
         self.m.create_session("user1", "10.0.0.1")
         self.m.create_session("user1", "10.0.0.2")
@@ -2306,6 +2350,53 @@ class LifecycleTests(unittest.TestCase):
             m.CONFIG["cameras"].pop(cam, None)
             m.cam_status.pop(cam, None)
             m.cam_health.pop(cam, None)
+
+    def test_worker_uses_live_only_when_disk_low(self):
+        m = self.m
+        cam = "cam-live-low"
+        m.CONFIG["cameras"][cam] = {
+            "name": "Live low disk", "rtsp_url": "rtsp://127.0.0.1:1/x",
+            "record_mode": "continuous", "video_codec": "copy", "audio_mode": "none",
+        }
+        m.cam_status[cam] = {}
+        captured = []
+        old_disk_low = m.disk_low
+
+        class FakeProc:
+            returncode = 0
+            def __init__(self, args, **kwargs):
+                captured.append(args)
+                self.stderr = io.StringIO("")
+            def poll(self):
+                return self.returncode
+            def wait(self, timeout=None):
+                return self.returncode
+
+        m.disk_low = lambda: True
+        try:
+            m.mark_viewer(cam)
+            with mock.patch.object(m.subprocess, "Popen", FakeProc):
+                m.start_camera_worker(cam)
+                deadline = time.time() + 4
+                while time.time() < deadline and not captured:
+                    time.sleep(0.02)
+                token = m.worker_tokens.get(cam)
+                if token:
+                    token.set()
+                while time.time() < deadline and m.worker_tokens.get(cam) is not None:
+                    time.sleep(0.02)
+            self.assertTrue(captured)
+            cmd = captured[0]
+            self.assertIn("hls", cmd)
+            self.assertNotIn("segment", cmd)
+            self.assertTrue(m.cam_status[cam].get("_disk_live_only"))
+        finally:
+            m.disk_low = old_disk_low
+            m.CONFIG["cameras"].pop(cam, None)
+            m.cam_status.pop(cam, None)
+            m.cam_health.pop(cam, None)
+            m.cam_viewers.pop(cam, None)
+            m.worker_tokens.pop(cam, None)
 
     def test_snapshot_slots_bounded(self):
         m = self.m
