@@ -1,6 +1,7 @@
 import base64
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -502,6 +503,65 @@ class ApiTests(_AppCase):
         finally:
             self.m.CONFIG["cameras"] = saved
 
+    def test_motion_zones_normalize_and_filter(self):
+        cam_id = "zonecam"
+        payload = {"cam_id": cam_id, "name": "Zone", "rtsp_url": "rtsp://127.0.0.1:1/x",
+                   "record_mode": "motion",
+                   "motion_zones": [
+                       {"x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+                       {"x": 0.9, "y": 0.9, "w": 0.5, "h": 0.5},
+                       {"x": "bad", "y": 0, "w": 0.1, "h": 0.1},
+                   ]}
+        self.assertEqual(self.client.post("/api/cameras", json=payload, headers=auth()).status_code, 200)
+        stored = self.client.get("/api/cameras", headers=auth()).json()[cam_id]
+        zones = stored["motion_zones"]
+        self.assertEqual(len(zones), 2)
+        self.assertAlmostEqual(zones[1]["w"], 0.1)
+        self.assertAlmostEqual(zones[1]["h"], 0.1)
+
+        self.assertEqual(self.m._motion_zone_hit(cam_id, [0.12, 0.12, 0.18, 0.18]),
+                         (True, "in_zone"))
+        self.assertEqual(self.m._motion_zone_hit(cam_id, [0.5, 0.5, 0.6, 0.6]),
+                         (False, "outside_zone"))
+        self.assertEqual(self.m._motion_zone_hit(cam_id, None), (True, "bbox_missing"))
+
+        conn = self.m.db_conn()
+        before = conn.execute("SELECT COUNT(*) FROM events WHERE cam_id=?", (cam_id,)).fetchone()[0]
+        r = self.client.post("/api/motion", json={"cam_id": cam_id, "label": "outside",
+                                                  "bbox": [0.5, 0.5, 0.6, 0.6]}, headers=auth())
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "ignored")
+        self.assertFalse(r.json()["zone_ok"])
+        after = conn.execute("SELECT COUNT(*) FROM events WHERE cam_id=?", (cam_id,)).fetchone()[0]
+        self.assertEqual(before, after)
+        self.client.delete(f"/api/cameras/{cam_id}", headers=auth())
+
+    def test_notify_schedule_helpers_and_persist(self):
+        saved = self.m.CONFIG.get("notify")
+        self.m.CONFIG["notify"] = {
+            "notify_schedule_enabled": True,
+            "notify_schedule": [{"days": [0], "from": "22:00", "to": "06:00"}],
+        }
+        try:
+            self.assertTrue(self.m._notify_schedule_allows(datetime(2026, 11, 23, 23, 0)))
+            self.assertTrue(self.m._notify_schedule_allows(datetime(2026, 11, 24, 1, 0)))
+            self.assertFalse(self.m._notify_schedule_allows(datetime(2026, 11, 24, 12, 0)))
+            self.assertFalse(self.m._notify_schedule_allows(datetime(2026, 11, 22, 23, 0)))
+            self.m.CONFIG["notify"]["notify_schedule_enabled"] = False
+            self.assertTrue(self.m._notify_schedule_allows(datetime(2026, 11, 24, 12, 0)))
+        finally:
+            self.m.CONFIG["notify"] = saved
+
+        r = self.client.post("/api/notify", json={
+            "notify_schedule_enabled": True,
+            "notify_schedule": [{"days": [0, 7, 2], "from": "09:05", "to": "25:99"}],
+        }, headers=auth())
+        self.assertEqual(r.status_code, 200)
+        j = self.client.get("/api/notify", headers=auth()).json()
+        self.assertTrue(j["notify_schedule_enabled"])
+        self.assertEqual(j["notify_schedule"], [{"days": [0, 2], "from": "09:05", "to": "23:59"}])
+        self.client.post("/api/notify", json={"notify_schedule_enabled": False}, headers=auth())
+
     def test_ai_detect_creates_labelled_event(self):
         payload = {"cam_id": "aicam", "name": "AI", "rtsp_url": "rtsp://127.0.0.1:1/x",
                    "record_mode": "motion"}
@@ -532,6 +592,23 @@ class ApiTests(_AppCase):
         self.assertEqual(j["disk_crit_percent"], 90)
         self.assertEqual(j["public_url"], "http://192.168.5.63:9895")
         self.client.post("/api/notify", json={"disk_alert_enabled": False}, headers=auth())
+
+    def test_notify_motion_respects_schedule(self):
+        saved = self.m.CONFIG.get("notify")
+        self.m.CONFIG["notify"] = {"webhook_url": "http://example.invalid/hook",
+                                   "with_photo": False}
+        try:
+            with mock.patch.object(self.m, "_notify_schedule_allows", return_value=False), \
+                    mock.patch.object(self.m.urllib.request, "urlopen") as uo:
+                self.m.notify_motion("schedcam", "test")
+                uo.assert_not_called()
+            with mock.patch.object(self.m, "_notify_schedule_allows", return_value=True), \
+                    mock.patch.object(self.m.urllib.request, "urlopen") as uo:
+                self.m.notify_motion("schedcam", "test")
+                self.assertEqual(uo.call_count, 1)
+        finally:
+            self.m.CONFIG["notify"] = saved
+            self.m._notify_last.pop("schedcam", None)
 
     def test_notify_threads_are_capped(self):
         deadline = time.time() + 2
@@ -1365,6 +1442,76 @@ class ApiTests(_AppCase):
         finally:
             self.m.CONFIG["gdrive"] = old
 
+    def test_drive_retry_and_skip_one(self):
+        cam, name = "drvact", "one.mp4"
+        rel = f"{cam}/{name}"
+        path = os.path.join(self.m.RECORDINGS_DIR, cam, name)
+        conn = self.m.db_conn()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(b"x")
+            old = time.time() - 120
+            os.utime(path, (old, old))
+            conn.execute("INSERT OR REPLACE INTO drive_uploads "
+                         "(path, cam_id, name, ts, size, status, error, tries) "
+                         "VALUES (?, ?, ?, ?, 1, 'error', 'x', 3)", (rel, cam, name, old))
+            conn.commit()
+            r = self.client.post(f"/api/drive/retry/{cam}/{name}", headers=auth())
+            self.assertEqual(r.status_code, 200, r.text)
+            row = conn.execute("SELECT status, tries, error FROM drive_uploads WHERE path=?", (rel,)).fetchone()
+            self.assertEqual(tuple(row), ("pending", 0, ""))
+            r = self.client.post(f"/api/drive/skip/{cam}/{name}", headers=auth())
+            self.assertEqual(r.status_code, 200, r.text)
+            row = conn.execute("SELECT status, error FROM drive_uploads WHERE path=?", (rel,)).fetchone()
+            self.assertEqual(row[0], "skipped")
+            self.assertIn("bỏ qua", row[1])
+        finally:
+            conn.execute("DELETE FROM drive_uploads WHERE path=?", (rel,))
+            conn.commit()
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_drive_delete_item_removes_file_and_row(self):
+        cam, name = "drvdel", "old.mp4"
+        rel = f"{cam}/{name}"
+        path = os.path.join(self.m.RECORDINGS_DIR, cam, name)
+        conn = self.m.db_conn()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(b"x")
+            old = time.time() - 120
+            os.utime(path, (old, old))
+            conn.execute("INSERT OR REPLACE INTO drive_uploads "
+                         "(path, cam_id, name, ts, size, status, error) VALUES (?, ?, ?, ?, 1, 'error', 'x')",
+                         (rel, cam, name, old))
+            conn.commit()
+            r = self.client.delete(f"/api/drive/item/{cam}/{name}", headers=auth())
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertTrue(r.json()["deleted_file"])
+            self.assertFalse(os.path.exists(path))
+            self.assertIsNone(conn.execute("SELECT 1 FROM drive_uploads WHERE path=?", (rel,)).fetchone())
+            self.assertEqual(self.client.delete(f"/api/drive/item/{cam}/{name}", headers=auth()).status_code, 404)
+
+            with open(path, "wb") as f:
+                f.write(b"x")
+            conn.execute("INSERT OR REPLACE INTO drive_uploads "
+                         "(path, cam_id, name, ts, size, status) VALUES (?, ?, ?, ?, 1, 'uploading')",
+                         (rel, cam, name, old))
+            conn.commit()
+            self.assertEqual(self.client.delete(f"/api/drive/item/{cam}/{name}", headers=auth()).status_code, 409)
+            self.assertTrue(os.path.exists(path))
+        finally:
+            conn.execute("DELETE FROM drive_uploads WHERE path=?", (rel,))
+            conn.commit()
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     def test_cleanup_keeps_locked_pending_and_active_files(self):
         cam = "cleancam"
         self.client.post("/api/cameras", json={"cam_id": cam, "name": "Clean",
@@ -1448,6 +1595,44 @@ class ApiTests(_AppCase):
                                       (f"{cam}/{new_name}",)).fetchone()
             self.assertEqual(old_status["status"], "skipped")
             self.assertEqual(new_status["status"], "pending")
+        finally:
+            self.m.CONFIG["retention_days"], self.m.CONFIG["max_storage_gb"], \
+                self.m.CONFIG["max_disk_percent"], self.m.CONFIG["min_free_percent"] = old_cfg
+            conn.execute("DELETE FROM drive_uploads WHERE cam_id=?", (cam,))
+            conn.commit()
+            shutil.rmtree(rec_dir, ignore_errors=True)
+            shutil.rmtree(snap_dir, ignore_errors=True)
+
+    def test_cleanup_evicts_drive_pending_under_storage_quota(self):
+        rec_dir = tempfile.mkdtemp(dir=self.sandbox)
+        snap_dir = tempfile.mkdtemp(dir=self.sandbox)
+        cam, name = "quotacam", "old.mp4"
+        cam_dir = os.path.join(rec_dir, cam)
+        os.makedirs(cam_dir)
+        path = os.path.join(cam_dir, name)
+        with open(path, "wb") as f:
+            f.write(b"x" * 4096)
+        os.utime(path, (1000.0, 1000.0))
+        conn = self.m.db_conn()
+        conn.execute("INSERT OR REPLACE INTO drive_uploads "
+                     "(path, cam_id, name, ts, size, status, tries, next_try, updated) "
+                     "VALUES (?, ?, ?, ?, 4096, 'pending', 0, 0, ?)",
+                     (f"{cam}/{name}", cam, name, 1000, time.time()))
+        conn.commit()
+        old_cfg = (self.m.CONFIG.get("retention_days"), self.m.CONFIG.get("max_storage_gb"),
+                   self.m.CONFIG.get("max_disk_percent"), self.m.CONFIG.get("min_free_percent"))
+        try:
+            self.m.CONFIG["retention_days"] = 0
+            self.m.CONFIG["max_storage_gb"] = 0.000001
+            self.m.CONFIG["max_disk_percent"] = 0
+            self.m.CONFIG["min_free_percent"] = 0
+            with mock.patch.object(self.m, "RECORDINGS_DIR", rec_dir), \
+                    mock.patch.object(self.m, "SNAPSHOTS_DIR", snap_dir):
+                self.m.run_cleanup_now()
+            self.assertFalse(os.path.exists(path))
+            row = conn.execute("SELECT status FROM drive_uploads WHERE path=?",
+                               (f"{cam}/{name}",)).fetchone()
+            self.assertEqual(row["status"], "skipped")
         finally:
             self.m.CONFIG["retention_days"], self.m.CONFIG["max_storage_gb"], \
                 self.m.CONFIG["max_disk_percent"], self.m.CONFIG["min_free_percent"] = old_cfg
@@ -2562,25 +2747,100 @@ class LifecycleTests(unittest.TestCase):
 
 
 class _FakeDriveHandler(BaseHTTPRequestHandler):
-    """Google Drive giả: /token + /files/<id>?alt=media, hỗ trợ Range và tự ngắt giữa chừng 1 lần."""
+    """Google Drive giả: tải xuống Range, upload resumable và ngắt kết nối 1 lần."""
     DATA = bytes((i * 7) % 251 for i in range(30000))
     drop_after = 10000
     hits = []
     dropped = False
+    UPLOADS = {}
+    UPLOAD_DROP = False
+    UPLOAD_DROPPED = False
+    UPLOAD_DROP_BYTES = 1000
 
     def log_message(self, format, *args):
         pass
 
+    def _read_body(self, n=None):
+        n = int(n if n is not None else (self.headers.get("Content-Length") or 0))
+        return self.rfile.read(max(0, n)) if n else b""
+
+    def _send_json(self, status, payload, headers=None):
+        raw = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def do_POST(self):
         if self.path.endswith("/token"):
-            body = b'{"access_token":"tok1","expires_in":3600}'
+            self._read_body()
+            self._send_json(200, {"access_token": "tok1", "expires_in": 3600})
+        elif "/files" in self.path and "uploadType=resumable" in self.path:
+            self._read_body()
+            sid = f"s{len(type(self).UPLOADS) + 1}"
+            total = int(self.headers.get("X-Upload-Content-Length") or 0)
+            type(self).UPLOADS[sid] = {"data": bytearray(), "total": total}
+            base = f"http://127.0.0.1:{self.server.server_address[1]}"
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Location", f"{base}/upload-session/{sid}")
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(body)
         else:
             self.send_error(404)
+
+    def do_PUT(self):
+        sid = self.path.rstrip("/").rsplit("/", 1)[-1]
+        state = type(self).UPLOADS.get(sid)
+        if state is None:
+            self.send_error(404)
+            return
+        cr = self.headers.get("Content-Range") or ""
+        m = re.match(r"bytes \*/(\d+)", cr)
+        if m:
+            total = int(m.group(1))
+            got = len(state["data"])
+            if got >= total:
+                self._send_json(200, {"id": "uploaded-" + sid})
+            else:
+                headers = {"Range": f"bytes=0-{got - 1}"} if got else {}
+                self.send_response(308)
+                for key, value in headers.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            return
+        m = re.match(r"bytes (\d+)-(\d+)/(\d+)", cr)
+        if not m:
+            self.send_error(400)
+            return
+        start, end, total = [int(x) for x in m.groups()]
+        body_len = int(self.headers.get("Content-Length") or 0)
+        if start != len(state["data"]):
+            got = len(state["data"])
+            self.send_response(308)
+            if got:
+                self.send_header("Range", f"bytes=0-{got - 1}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if type(self).UPLOAD_DROP and not type(self).UPLOAD_DROPPED and body_len > 0:
+            take = min(type(self).UPLOAD_DROP_BYTES, body_len)
+            state["data"].extend(self._read_body(take))
+            type(self).UPLOAD_DROPPED = True
+            self.close_connection = True
+            return
+        state["data"].extend(self._read_body(body_len))
+        got = len(state["data"])
+        if got >= total:
+            self._send_json(200, {"id": "uploaded-" + sid})
+        else:
+            self.send_response(308)
+            self.send_header("Range", f"bytes=0-{got - 1}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
     def do_GET(self):
         if "/files/" not in self.path:
@@ -2612,12 +2872,20 @@ class _FakeDriveHandler(BaseHTTPRequestHandler):
 class DrivePlaybackTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._env_backup = {k: os.environ.get(k) for k in ("NVR_DRIVE_API_BASE", "NVR_DRIVE_OAUTH_BASE")}
+        cls._env_backup = {k: os.environ.get(k) for k in (
+            "NVR_DRIVE_API_BASE", "NVR_DRIVE_OAUTH_BASE", "NVR_DRIVE_UPLOAD_BASE",
+            "NVR_DRIVE_CHUNK", "NVR_DRIVE_CHUNK_MIN", "NVR_DRIVE_CHUNK_MAX",
+            "NVR_DRIVE_UPLOAD_RETRIES")}
         cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), _FakeDriveHandler)
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
         cls.sandbox, cls.m = load_app({"NVR_DRIVE_API_BASE": base + "/drive/v3",
-                                       "NVR_DRIVE_OAUTH_BASE": base})
+                                       "NVR_DRIVE_OAUTH_BASE": base,
+                                       "NVR_DRIVE_UPLOAD_BASE": base + "/upload/drive/v3",
+                                       "NVR_DRIVE_CHUNK": "4096",
+                                       "NVR_DRIVE_CHUNK_MIN": "1024",
+                                       "NVR_DRIVE_CHUNK_MAX": "8192",
+                                       "NVR_DRIVE_UPLOAD_RETRIES": "4"})
         from fastapi.testclient import TestClient
         cls.client = TestClient(cls.m.app)
         cls.client.__enter__()
@@ -2637,6 +2905,9 @@ class DrivePlaybackTests(unittest.TestCase):
     def setUp(self):
         _FakeDriveHandler.hits = []
         _FakeDriveHandler.dropped = False
+        _FakeDriveHandler.UPLOADS = {}
+        _FakeDriveHandler.UPLOAD_DROP = False
+        _FakeDriveHandler.UPLOAD_DROPPED = False
         name = f"2026-10-19_{self._testMethodName[:12]}.mp4"
         self.cam, self.name = "cam9", name
         self.rel = f"{self.cam}/{self.name}"
@@ -2663,6 +2934,53 @@ class DrivePlaybackTests(unittest.TestCase):
         self.assertEqual(_FakeDriveHandler.hits, [0, 10000])
         self.assertEqual(prog["done"], len(_FakeDriveHandler.DATA))
         self.assertFalse(os.path.exists(self.path + ".part"))
+
+    def test_drive_upload_resumes_after_connection_drop(self):
+        with open(self.path, "wb") as f:
+            f.write(_FakeDriveHandler.DATA)
+        _FakeDriveHandler.UPLOAD_DROP = True
+        progress = []
+        res = self.m.drive_upload_file(self.path, self.name, "folder", 0,
+                                       on_progress=lambda done, url, total: progress.append((done, url, total)))
+        self.assertEqual(res.get("id"), "uploaded-s1")
+        self.assertTrue(_FakeDriveHandler.UPLOAD_DROPPED)
+        self.assertEqual(bytes(_FakeDriveHandler.UPLOADS["s1"]["data"]), _FakeDriveHandler.DATA)
+        self.assertTrue(progress)
+        self.assertEqual(progress[-1][0], len(_FakeDriveHandler.DATA))
+
+    def test_drive_upload_resumes_saved_session_without_restarting(self):
+        with open(self.path, "wb") as f:
+            f.write(_FakeDriveHandler.DATA)
+        sid = "resume-session"
+        _FakeDriveHandler.UPLOADS[sid] = {
+            "data": bytearray(_FakeDriveHandler.DATA[:1000]),
+            "total": len(_FakeDriveHandler.DATA)}
+        session_url = f"http://127.0.0.1:{self.srv.server_address[1]}/upload-session/{sid}"
+        res = self.m.drive_upload_file(
+            self.path, self.name, "folder", 0,
+            resume={"session_url": session_url, "session_size": len(_FakeDriveHandler.DATA),
+                    "uploaded": 1000})
+        self.assertEqual(res.get("id"), "uploaded-" + sid)
+        self.assertEqual(bytes(_FakeDriveHandler.UPLOADS[sid]["data"]), _FakeDriveHandler.DATA)
+
+    def test_drive_process_row_persists_done_and_clears_session(self):
+        with open(self.path, "wb") as f:
+            f.write(_FakeDriveHandler.DATA)
+        conn = self.m.db_conn()
+        conn.execute("UPDATE drive_uploads SET status='pending', session_url='', session_size=0, uploaded=0 "
+                     "WHERE path=?", (self.rel,))
+        conn.commit()
+        row = conn.execute("SELECT * FROM drive_uploads WHERE path=?", (self.rel,)).fetchone()
+        _FakeDriveHandler.UPLOAD_DROP = True
+        with mock.patch.object(self.m, "drive_upload_folder", return_value="folder"):
+            status = self.m.drive_process_row(row)
+        self.assertEqual(status, "done")
+        row = conn.execute("SELECT * FROM drive_uploads WHERE path=?", (self.rel,)).fetchone()
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["drive_id"], "uploaded-s1")
+        self.assertEqual(row["uploaded"], len(_FakeDriveHandler.DATA))
+        self.assertEqual(row["session_url"], "")
+        self.assertTrue(_FakeDriveHandler.UPLOAD_DROPPED)
 
     def test_play_status_starts_fetch_without_video_request(self):
         r = self.client.get(f"/api/drive/play/{self.cam}/{self.name}", headers=auth())

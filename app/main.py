@@ -7,6 +7,7 @@ import base64
 import hmac
 import shutil
 import socket
+import http.client
 import hashlib
 import sqlite3
 import secrets
@@ -26,7 +27,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 import anyio
 from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.staticfiles import StaticFiles
@@ -42,7 +43,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.28").strip() or "1.9.28"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.29").strip() or "1.9.29"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -81,6 +82,11 @@ DRIVE_SCAN_SEC = max(DRIVE_TICK, float(os.environ.get("NVR_DRIVE_SCAN_SEC", "60"
 DRIVE_CHUNK = int(os.environ.get("NVR_DRIVE_CHUNK", str(16 * 1024 * 1024)))
 DRIVE_RETRY_BASE = float(os.environ.get("NVR_DRIVE_RETRY_BASE", "60"))
 DRIVE_MAX_PARALLEL = 64
+DRIVE_CHUNK_MIN = max(256 * 1024, int(os.environ.get("NVR_DRIVE_CHUNK_MIN", str(256 * 1024))))
+DRIVE_CHUNK_MAX = max(DRIVE_CHUNK_MIN, int(os.environ.get("NVR_DRIVE_CHUNK_MAX", str(32 * 1024 * 1024))))
+DRIVE_UPLOAD_TIMEOUT = max(30.0, float(os.environ.get("NVR_DRIVE_UPLOAD_TIMEOUT", "180") or "180"))
+DRIVE_SESSION_TIMEOUT = max(10.0, float(os.environ.get("NVR_DRIVE_SESSION_TIMEOUT", "60") or "60"))
+DRIVE_UPLOAD_RETRIES = max(1, min(20, int(os.environ.get("NVR_DRIVE_UPLOAD_RETRIES", "8") or "8")))
 
 for d in [RECORDINGS_DIR, SNAPSHOTS_DIR, HLS_DIR, PLAYBACK_HLS_DIR, BUFFER_DIR, THUMBS_DIR, PLAYBACK_CACHE_DIR, MQTT_SNAPSHOT_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -433,7 +439,9 @@ DEFAULT_CONFIG = {
         "disk_alert_enabled": False,
         "disk_warn_percent": 85,
         "disk_crit_percent": 95,
-        "camera_offline_alert": True
+        "camera_offline_alert": True,
+        "notify_schedule_enabled": False,
+        "notify_schedule": []          # [{days:[0-6], from:"HH:MM", to:"HH:MM"}]
     },
     "license": {
         "enforce": True,
@@ -585,7 +593,54 @@ def _normalize_config(cfg: dict) -> dict:
     for cam in cfg.get("cameras", {}).values():
         if cam.get("video_codec") in (None, "", "copy"):
             cam["video_codec"] = "auto"
+        cam["motion_zones"] = _norm_motion_zones(cam.get("motion_zones"))
+    nt["notify_schedule"] = _norm_notify_schedule(nt.get("notify_schedule"))
     return cfg
+
+def _norm_motion_zones(zones: Any) -> List[dict]:
+    """Chuẩn hoá vùng ROI chuyển động: toạ độ 0..1, mỗi vùng {x,y,w,h}."""
+    out = []
+    for z in (zones if isinstance(zones, list) else []):
+        if not isinstance(z, dict):
+            continue
+        try:
+            x = max(0.0, min(1.0, float(z.get("x", 0))))
+            y = max(0.0, min(1.0, float(z.get("y", 0))))
+            w = max(0.0, min(1.0 - x, float(z.get("w", 0))))
+            h = max(0.0, min(1.0 - y, float(z.get("h", 0))))
+        except (TypeError, ValueError):
+            continue
+        if w >= 0.01 and h >= 0.01:
+            out.append({"x": round(x, 4), "y": round(y, 4),
+                        "w": round(w, 4), "h": round(h, 4)})
+        if len(out) >= 20:
+            break
+    return out
+
+def _norm_notify_schedule(windows: Any) -> List[dict]:
+    """Chuẩn hoá lịch thông báo: các khung giờ trong tuần (0=T2 … 6=CN)."""
+    def hhmm(value, default):
+        m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", str(value or "").strip())
+        return f"{int(m.group(1)):02d}:{m.group(2)}" if m else default
+
+    out = []
+    for w in (windows if isinstance(windows, list) else []):
+        if not isinstance(w, dict):
+            continue
+        days = []
+        for d in (w.get("days") or []):
+            try:
+                d = int(d)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= d <= 6 and d not in days:
+                days.append(d)
+        start = hhmm(w.get("from"), "18:00")
+        end = hhmm(w.get("to"), "23:59")
+        out.append({"days": sorted(days), "from": start, "to": end})
+        if len(out) >= 32:
+            break
+    return out
 
 def _norm_hass_entity(ent: Any) -> Optional[dict]:
     """Chuẩn hoá một cảm biến HA: hỗ trợ dạng chuỗi cũ và dạng {entity_id, state, label}."""
@@ -738,9 +793,17 @@ def init_db():
             drive_id TEXT,
             tries INTEGER DEFAULT 0,
             next_try REAL DEFAULT 0,
-            updated REAL
+            updated REAL,
+            session_url TEXT,
+            session_size INTEGER,
+            uploaded INTEGER DEFAULT 0
         )
     """)
+    drive_cols = {row[1] for row in c.execute("PRAGMA table_info(drive_uploads)").fetchall()}
+    for col, decl in (("session_url", "TEXT"), ("session_size", "INTEGER"),
+                      ("uploaded", "INTEGER DEFAULT 0")):
+        if col not in drive_cols:
+            c.execute(f"ALTER TABLE drive_uploads ADD COLUMN {col} {decl}")
     c.execute("CREATE INDEX IF NOT EXISTS idx_drive_status ON drive_uploads(status, next_try)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_drive_ts ON drive_uploads(ts)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_drive_cam_path ON drive_uploads(cam_id, path)")
@@ -3460,7 +3523,9 @@ def run_cleanup_now():
             for file in files:
                 fp = os.path.join(root, file)
                 try:
-                    if _protected(fp, allow_drive_eviction=disk_pressure):
+                    # Đưa cả file Drive đang chờ vào phép tính dung lượng; chỉ xoá
+                    # chúng khi thật sự vượt hạn mức GB/% ổ đĩa.
+                    if _protected(fp, allow_drive_eviction=True):
                         continue
                     all_media.append((os.path.getmtime(fp), os.path.getsize(fp), fp))
                 except Exception:
@@ -3479,19 +3544,22 @@ def run_cleanup_now():
         if not (over_gb or over_pct):
             break
         rel = os.path.relpath(fp, RECORDINGS_DIR)
-        drive_evict = disk_pressure and not rel.startswith("..") and rel in drive_pending
+        drive_pending_rel = not rel.startswith("..") and rel in drive_pending
+        drive_evict = drive_pending_rel and (disk_pressure or over_gb)
+        if drive_pending_rel and not drive_evict:
+            continue
         try:
             os.remove(fp)
             media_bytes -= fsize
             deleted_count += 1
             if drive_evict:
-                log_event("warn", f"Ổ đĩa đầy: xoá bản ghi chưa tải lên Drive để giải phóng chỗ: {rel}")
+                log_event("warn", f"Dọn dung lượng: xoá bản ghi chưa tải lên Drive: {rel}")
                 try:
                     conn = db_conn()
                     conn.execute(
                         "UPDATE drive_uploads SET status='skipped', error=?, updated=? "
                         "WHERE path=? AND status IN ('pending','uploading','error')",
-                        ("đã xoá để giải phóng ổ đĩa", time.time(), rel))
+                        ("đã xoá để giải phóng dung lượng", time.time(), rel))
                     conn.commit()
                 except Exception as e:
                     log_event("warn", f"cleanup drive state: {e}")
@@ -3645,6 +3713,7 @@ class CameraItem(BaseModel):
     max_gb: float = 0                # Hạn mức dung lượng riêng (0 = dùng mức chung toàn hệ thống)
     schedule_enabled: bool = False   # Bật lịch ghi hình theo giờ
     schedule: List[Dict[str, Any]] = []  # [{days:[0-6], from:"18:00", to:"06:00", mode:"motion"}]
+    motion_zones: List[Dict[str, Any]] = []  # Vùng ROI: [{x,y,w,h}] toạ độ 0..1
     hass_entities: List[Any] = []        # Cảm biến HA: [{entity_id, state(kích hoạt), label}] hoặc chuỗi cũ
 
 class StorageSettings(BaseModel):
@@ -3671,6 +3740,8 @@ class NotifySettings(BaseModel):
     disk_warn_percent: float = 85
     disk_crit_percent: float = 95
     camera_offline_alert: bool = True
+    notify_schedule_enabled: bool = False
+    notify_schedule: List[Dict[str, Any]] = []  # [{days:[0-6], from:"HH:MM", to:"HH:MM"}]
 
 class AiSettings(BaseModel):
     enabled: bool = False
@@ -3735,12 +3806,14 @@ class ClientLogReq(BaseModel):
 class MotionPayload(BaseModel):
     cam_id: str
     label: str = "Chuyển động (HASS)"
+    bbox: Optional[List[float]] = None  # [x1,y1,x2,y2] chuẩn hoá 0..1 (tùy chọn)
 
 class AiDetectPayload(BaseModel):
     cam_id: str
     objects: List[str] = []      # person, car, truck, ... (tự dịch sang tiếng Việt)
     label: str = ""              # ghi đè nhãn nếu muốn
     snapshot_url: str = ""       # ảnh AI gửi kèm (tùy chọn, http/https)
+    bbox: Optional[List[float]] = None  # [x1,y1,x2,y2] chuẩn hoá 0..1 (tùy chọn)
 
 def _host_load():
     """Tải CPU + RAM của máy chủ (đọc /proc, không cần thư viện ngoài)."""
@@ -4084,6 +4157,7 @@ def _camera_record(item: CameraItem) -> dict:
         "max_gb": max(0.0, float(item.max_gb or 0)),
         "schedule_enabled": bool(item.schedule_enabled),
         "schedule": [w for w in (item.schedule or []) if isinstance(w, dict)],
+        "motion_zones": _norm_motion_zones(item.motion_zones),
         **_norm_cam_hass(item),
     }
 
@@ -4902,18 +4976,50 @@ def _capture_event_clip(cam_id: str, seconds: int) -> str:
         if proc and proc.poll() is None:
             _terminate_process(proc)
 
+def _notify_schedule_allows(now: Optional[datetime] = None) -> bool:
+    """Kiểm tra khung giờ nhận thông báo chuyển động (giờ máy chủ)."""
+    cfg = CONFIG.get("notify") or {}
+    if not cfg.get("notify_schedule_enabled"):
+        return True
+    windows = _norm_notify_schedule(cfg.get("notify_schedule"))
+    if not windows:
+        return True
+    now = now or datetime.now()
+    day, cur = now.weekday(), now.hour * 60 + now.minute
+    for w in windows:
+        days = w.get("days") or []
+        try:
+            sh, sm = [int(v) for v in w["from"].split(":")]
+            eh, em = [int(v) for v in w["to"].split(":")]
+        except (KeyError, ValueError):
+            continue
+        start, end = sh * 60 + sm, eh * 60 + em
+        if start <= end:
+            if (not days or day in days) and start <= cur <= end:
+                return True
+        else:
+            # Khung qua nửa đêm: ngày bắt đầu thuộc hôm trước.
+            if day in days and cur >= start:
+                return True
+            if (not days or ((day - 1) % 7) in days) and cur <= end:
+                return True
+    return False
+
 def notify_motion(cam_id: str, label: str, snapshot_path: str = "",
                   event_id: Optional[int] = None, event_ts: Optional[int] = None):
     """Mô tả AI + gửi thông báo Telegram/webhook (chạy trong thread riêng)."""
     cfg = CONFIG.get("notify") or {}
     ai_cfg = _ai_settings()
+    in_schedule = _notify_schedule_allows()
     tg_configured = bool(cfg.get("telegram_enabled") and cfg.get("telegram_token")
                          and cfg.get("telegram_chat_id"))
-    needs_license = tg_configured or bool(ai_cfg.get("enabled"))
+    tg_on = bool(tg_configured and in_schedule)
+    wh = (cfg.get("webhook_url") or "").strip() if in_schedule else ""
+    ai_on = bool(ai_cfg.get("enabled"))
+    needs_license = tg_on or ai_on
     licensed = _license_gate("Thông báo Telegram/Mô tả AI") if needs_license else True
-    tg_on = bool(tg_configured and licensed)
-    wh = (cfg.get("webhook_url") or "").strip()
-    ai_on = bool(ai_cfg.get("enabled") and licensed)
+    tg_on = bool(tg_on and licensed)
+    ai_on = bool(ai_on and licensed)
     if not tg_on and not wh and not ai_on:
         return
     now = time.time()
@@ -5268,11 +5374,47 @@ def _download_snapshot(url: str, dest: str, max_bytes: int = 8 * 1024 * 1024) ->
     return _fetch_snapshot(url, dest, max_bytes=max_bytes, label="AI")
 
 
-def handle_motion(cam_id: str, label: str, snap_url: str = ""):
+def _norm_motion_bbox(bbox: Any) -> Optional[tuple]:
+    """Chuẩn hoá bbox [x1,y1,x2,y2] về 0..1; trả None nếu không hợp lệ."""
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+    except (TypeError, ValueError):
+        return None
+    x1, x2 = sorted((max(0.0, min(1.0, x1)), max(0.0, min(1.0, x2))))
+    y1, y2 = sorted((max(0.0, min(1.0, y1)), max(0.0, min(1.0, y2))))
+    if x2 - x1 < 0.001 or y2 - y1 < 0.001:
+        return None
+    return x1, y1, x2, y2
+
+def _motion_zone_hit(cam_id: str, bbox: Any) -> tuple:
+    """Trả (được phép, lý do). Không có ROI hoặc không có bbox thì cho qua."""
+    cam = CONFIG.get("cameras", {}).get(cam_id) or {}
+    zones = _norm_motion_zones(cam.get("motion_zones"))
+    if not zones:
+        return True, "no_zones"
+    box = _norm_motion_bbox(bbox)
+    if not box:
+        # Cảm biến HA/nhà cung cấp cũ không gửi toạ độ: không chặn để tránh mất báo.
+        return True, "bbox_missing"
+    cx = (box[0] + box[2]) / 2
+    cy = (box[1] + box[3]) / 2
+    for z in zones:
+        if z["x"] <= cx <= z["x"] + z["w"] and z["y"] <= cy <= z["y"] + z["h"]:
+            return True, "in_zone"
+    return False, "outside_zone"
+
+def handle_motion(cam_id: str, label: str, snap_url: str = "", bbox: Any = None):
     """Ghi nhận 1 sự kiện chuyển động: kích hoạt ghi hình + chụp snapshot + lưu event."""
     cam_info = CONFIG.get("cameras", {}).get(cam_id)
     if not cam_info:
         return None
+
+    zone_ok, zone_reason = _motion_zone_hit(cam_id, bbox)
+    if not zone_ok:
+        log_event("info", f"Bỏ qua chuyển động ngoài vùng ROI: {label}", cam_id)
+        return {"status": "ignored", "reason": zone_reason, "zone_ok": False}
 
     now = datetime.now()
     ts = int(now.timestamp())
@@ -5319,14 +5461,16 @@ def handle_motion(cam_id: str, label: str, snap_url: str = ""):
         "timestamp": ts,
         "record_mode": cam_info.get("record_mode", "continuous"),
         "pre_roll_sec": MOTION_PREROLL_SEC,
-        "recording_until": motion_active_until[cam_id]
+        "recording_until": motion_active_until[cam_id],
+        "zone_ok": True,
+        "zone_reason": zone_reason
     }
 
 
 @app.post("/api/motion")
 def trigger_motion(payload: MotionPayload, request: Request):
     assert_cam_access(request, payload.cam_id)
-    result = handle_motion(payload.cam_id, payload.label)
+    result = handle_motion(payload.cam_id, payload.label, bbox=payload.bbox)
     if result is None:
         raise HTTPException(status_code=404, detail="Camera không tồn tại")
     return result
@@ -5337,7 +5481,7 @@ def trigger_ai_detect(payload: AiDetectPayload, request: Request):
     ghi thành sự kiện có nhãn tiếng Việt (Người, Xe...)."""
     assert_cam_access(request, payload.cam_id)
     label = ai_event_label(payload.objects, payload.label)
-    result = handle_motion(payload.cam_id, label, payload.snapshot_url)
+    result = handle_motion(payload.cam_id, label, payload.snapshot_url, bbox=payload.bbox)
     if result is None:
         raise HTTPException(status_code=404, detail="Camera không tồn tại")
     return result
@@ -6510,6 +6654,8 @@ def get_notify_settings():
         "disk_warn_percent": float(nt.get("disk_warn_percent", 85) or 85),
         "disk_crit_percent": float(nt.get("disk_crit_percent", 95) or 95),
         "camera_offline_alert": bool(nt.get("camera_offline_alert", True)),
+        "notify_schedule_enabled": bool(nt.get("notify_schedule_enabled", False)),
+        "notify_schedule": _norm_notify_schedule(nt.get("notify_schedule")),
     }
 
 @app.post("/api/notify")
@@ -6528,6 +6674,8 @@ def update_notify_settings(settings: NotifySettings):
     nt["disk_warn_percent"] = float(settings.disk_warn_percent or 85)
     nt["disk_crit_percent"] = float(settings.disk_crit_percent or 95)
     nt["camera_offline_alert"] = settings.camera_offline_alert
+    nt["notify_schedule_enabled"] = bool(settings.notify_schedule_enabled)
+    nt["notify_schedule"] = _norm_notify_schedule(settings.notify_schedule)
     save_config(CONFIG)
     log_event("info", "Đã lưu cấu hình thông báo")
     return {"status": "ok"}
@@ -7380,6 +7528,14 @@ class DriveHttpError(Exception):
 class DriveAuthError(Exception):
     pass
 
+class DriveTransientError(Exception):
+    """Lỗi mạng tạm thời; uploader sẽ hỏi lại offset và tải tiếp."""
+    pass
+
+class DriveSessionExpired(Exception):
+    """Phiên upload resumable đã hết hạn; cần tạo phiên mới."""
+    pass
+
 
 def gd_cfg() -> dict:
     g = CONFIG.setdefault("gdrive", dict(DEFAULT_CONFIG["gdrive"]))
@@ -7574,77 +7730,260 @@ def drive_upload_folder(cam_id: str, day: str) -> str:
         return drive_ensure_folder(cam_name, day_id)
 
 
-def drive_upload_file(local_path: str, name: str, parent_id: str, kbps: int = 0) -> dict:
-    """Upload resumable từng phần (chunk). Giới hạn tốc độ kbps: 0 = không giới hạn."""
-    token = drive_access_token()
-    size = os.path.getsize(local_path)
-    meta = {"name": name, "parents": [parent_id]}
-    req = urllib.request.Request(
-        DRIVE_UPLOAD_BASE + "/files?uploadType=resumable&supportsAllDrives=true",
-        data=json.dumps(meta).encode(), method="POST",
-        headers={"Authorization": "Bearer " + token,
-                 "Content-Type": "application/json; charset=UTF-8",
-                 "X-Upload-Content-Type": "video/mp4",
-                 "X-Upload-Content-Length": str(size)})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            session_url = r.headers.get("Location") or ""
-    except urllib.error.HTTPError as e:
-        raw = e.read()
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            payload = {"raw": raw.decode("utf-8", "replace")[:400]}
-        raise DriveHttpError(e.code, payload)
-    if not session_url:
-        raise DriveHttpError(500, {"error": "Google không trả URL phiên upload"})
+def _drive_range_offset(value: str, default: int = 0) -> int:
+    """Đổi header Range của Google (bytes=0-123) thành offset byte kế tiếp."""
+    m = re.match(r"bytes=(\d+)-(\d+)", value or "")
+    if m:
+        return int(m.group(2)) + 1
+    m = re.match(r"bytes=(\d+)-", value or "")
+    if m:
+        return int(m.group(1))
+    return default
 
-    chunk_size = DRIVE_CHUNK if kbps <= 0 else max(262144, min(int(kbps * 125 * 5), 32 * 1024 * 1024))
-    pos = 0
-    with open(local_path, "rb") as f:
-        while pos < size:
-            chunk = f.read(min(chunk_size, size - pos))
-            if not chunk:
-                break
-            end = pos + len(chunk)
-            if kbps > 0:
-                time.sleep(len(chunk) / max(1, kbps * 125))
-            for attempt in range(4):
-                try:
-                    req = urllib.request.Request(
-                        session_url, data=chunk, method="PUT",
-                        headers={"Content-Range": f"bytes {pos}-{end - 1}/{size}",
-                                 "Content-Length": str(len(chunk))})
-                    with urllib.request.urlopen(req, timeout=180) as r:
-                        raw = r.read()
-                        return json.loads(raw) if raw else {}
-                except urllib.error.HTTPError as e:
-                    if e.code == 308:  # chưa xong, Google đã nhận chunk
-                        break
-                    if e.code >= 500 and attempt < 3:
-                        time.sleep(3 * (attempt + 1))
-                        continue
-                    raw = e.read()
-                    try:
-                        payload = json.loads(raw)
-                    except Exception:
-                        payload = {"raw": raw.decode("utf-8", "replace")[:400]}
-                    raise DriveHttpError(e.code, payload)
-            pos = end
-    # Hiếm khi tới đây (file thay đổi kích thước giữa chừng) — hỏi trạng thái cuối
-    req = urllib.request.Request(session_url, data=b"", method="PUT",
-                                 headers={"Content-Range": f"bytes */{size}"})
+def _drive_create_session(name: str, parent_id: str, size: int) -> str:
+    """Tạo phiên upload resumable mới và trả về URL phiên."""
+    meta = {"name": name, "parents": [parent_id]}
+    for attempt in range(2):
+        token = drive_access_token(force=attempt > 0)
+        req = urllib.request.Request(
+            DRIVE_UPLOAD_BASE + "/files?uploadType=resumable&supportsAllDrives=true",
+            data=json.dumps(meta).encode(), method="POST",
+            headers={"Authorization": "Bearer " + token,
+                     "Content-Type": "application/json; charset=UTF-8",
+                     "X-Upload-Content-Type": "video/mp4",
+                     "X-Upload-Content-Length": str(size)})
+        try:
+            with urllib.request.urlopen(req, timeout=DRIVE_SESSION_TIMEOUT) as r:
+                session_url = r.headers.get("Location") or ""
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {"raw": raw.decode("utf-8", "replace")[:400]}
+            if e.code == 401 and attempt == 0:
+                continue
+            raise DriveHttpError(e.code, payload)
+        except (urllib.error.URLError, TimeoutError, ConnectionError,
+                http.client.HTTPException, OSError) as e:
+            raise DriveTransientError(str(e) or e.__class__.__name__)
+        if not session_url:
+            raise DriveHttpError(500, {"error": "Google không trả URL phiên upload"})
+        return session_url
+    raise DriveAuthError("Google từ chối cấp phiên upload — cần kết nối lại Google Drive")
+
+def _drive_session_status(session_url: str, size: int) -> dict:
+    """Hỏi Google đã nhận tới byte nào. Trả {done, offset, payload}."""
+    req = urllib.request.Request(
+        session_url, data=b"", method="PUT",
+        headers={"Content-Range": f"bytes */{size}", "Content-Length": "0"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=DRIVE_SESSION_TIMEOUT) as r:
             raw = r.read()
-            return json.loads(raw) if raw else {}
+            try:
+                payload = json.loads(raw) if raw else {}
+            except Exception:
+                payload = {}
+            return {"done": True, "offset": size, "payload": payload}
     except urllib.error.HTTPError as e:
         raw = e.read()
+        if e.code == 308:
+            return {"done": False,
+                    "offset": _drive_range_offset(
+                        e.headers.get("Range") or e.headers.get("Content-Range") or "", 0),
+                    "payload": {}}
+        if e.code in (404, 410):
+            raise DriveSessionExpired(f"phiên upload đã hết hạn ({e.code})")
         try:
             payload = json.loads(raw)
         except Exception:
             payload = {"raw": raw.decode("utf-8", "replace")[:400]}
         raise DriveHttpError(e.code, payload)
+    except (urllib.error.URLError, TimeoutError, ConnectionError,
+            http.client.HTTPException, OSError) as e:
+        raise DriveTransientError(str(e) or e.__class__.__name__)
+
+def _drive_put_chunk(session_url: str, chunk: bytes, pos: int, size: int) -> dict:
+    """Gửi một chunk; trả done/payload hoặc offset Google đã nhận."""
+    end = pos + len(chunk)
+    req = urllib.request.Request(
+        session_url, data=chunk, method="PUT",
+        headers={"Content-Range": f"bytes {pos}-{end - 1}/{size}",
+                 "Content-Length": str(len(chunk))})
+    try:
+        with urllib.request.urlopen(req, timeout=DRIVE_UPLOAD_TIMEOUT) as r:
+            raw = r.read()
+            try:
+                payload = json.loads(raw) if raw else {}
+            except Exception:
+                payload = {}
+            return {"done": True, "offset": size, "payload": payload}
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        if e.code == 308:
+            return {"done": False,
+                    "offset": _drive_range_offset(
+                        e.headers.get("Range") or e.headers.get("Content-Range") or "",
+                        pos + len(chunk)),
+                    "payload": {}}
+        if e.code in (404, 410):
+            raise DriveSessionExpired(f"phiên upload đã hết hạn ({e.code})")
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = {"raw": raw.decode("utf-8", "replace")[:400]}
+        raise DriveHttpError(e.code, payload)
+    except (urllib.error.URLError, TimeoutError, ConnectionError,
+            http.client.HTTPException, OSError) as e:
+        raise DriveTransientError(str(e) or e.__class__.__name__)
+
+def drive_upload_file(local_path: str, name: str, parent_id: str, kbps: int = 0,
+                      resume: Optional[dict] = None,
+                      on_progress: Optional[Callable] = None) -> dict:
+    """Upload resumable, tự hỏi offset và tải tiếp sau khi mạng đứt/timeout.
+
+    resume: {session_url, session_size, uploaded} đã lưu trong SQLite.
+    on_progress(uploaded, session_url, size) được gọi sau mỗi chunk để lưu tiến độ.
+    """
+    size = os.path.getsize(local_path)
+    resume = resume or {}
+    session_url = str(resume.get("session_url") or "").strip()
+    session_size = int(resume.get("session_size") or 0)
+    pos = 0
+    if session_url and session_size == size:
+        try:
+            st = _drive_session_status(session_url, size)
+            if st["done"]:
+                if on_progress:
+                    on_progress(size, session_url, size)
+                return st.get("payload") or {}
+            pos = max(0, min(size, int(st.get("offset") or 0)))
+        except DriveSessionExpired:
+            session_url = ""
+        except DriveTransientError:
+            pos = max(0, min(size, int(resume.get("uploaded") or 0)))
+    elif session_url:
+        session_url = ""
+
+    if not session_url:
+        session_url = _drive_create_session(name, parent_id, size)
+        pos = 0
+
+    if kbps > 0:
+        target_chunk = max(DRIVE_CHUNK_MIN, min(DRIVE_CHUNK_MAX, int(kbps * 125 * 5)))
+    else:
+        target_chunk = max(DRIVE_CHUNK_MIN, min(DRIVE_CHUNK_MAX, DRIVE_CHUNK))
+    chunk_size = target_chunk
+    failures = 0
+    last_progress = {"pos": -1, "t": 0.0}
+
+    def report(force: bool = False):
+        if not on_progress:
+            return
+        now = time.time()
+        if (not force and pos < size and
+                pos - last_progress["pos"] < max(256 * 1024, target_chunk // 2) and
+                now - last_progress["t"] < 2):
+            return
+        last_progress["pos"] = pos
+        last_progress["t"] = now
+        try:
+            on_progress(pos, session_url, size)
+        except Exception:
+            pass
+
+    report(force=True)
+    while pos < size:
+        with open(local_path, "rb") as f:
+            f.seek(pos)
+            chunk = f.read(min(chunk_size, size - pos))
+        if not chunk:
+            break
+        if kbps > 0:
+            time.sleep(len(chunk) / max(1, kbps * 125))
+        try:
+            res = _drive_put_chunk(session_url, chunk, pos, size)
+        except DriveSessionExpired:
+            session_url = _drive_create_session(name, parent_id, size)
+            pos = 0
+            failures = 0
+            report(force=True)
+            continue
+        except DriveTransientError:
+            failures += 1
+            if failures > DRIVE_UPLOAD_RETRIES:
+                raise
+            time.sleep(min(30, 2 ** failures))
+            try:
+                st = _drive_session_status(session_url, size)
+                if st["done"]:
+                    report(force=True)
+                    return st.get("payload") or {}
+                new_pos = max(0, min(size, int(st.get("offset") or 0)))
+                if new_pos > pos:
+                    pos = new_pos
+                    report(force=True)
+            except DriveTransientError:
+                pass
+            except DriveSessionExpired:
+                session_url = _drive_create_session(name, parent_id, size)
+                pos = 0
+                failures = 0
+                report(force=True)
+            chunk_size = max(DRIVE_CHUNK_MIN, chunk_size // 2)
+            continue
+        except DriveHttpError as e:
+            if e.status in (429, 500, 502, 503, 504):
+                failures += 1
+                if failures > DRIVE_UPLOAD_RETRIES:
+                    raise
+                time.sleep(min(30, 2 ** failures))
+                try:
+                    st = _drive_session_status(session_url, size)
+                    if st["done"]:
+                        report(force=True)
+                        return st.get("payload") or {}
+                    new_pos = max(0, min(size, int(st.get("offset") or 0)))
+                    if new_pos > pos:
+                        pos = new_pos
+                        report(force=True)
+                except (DriveTransientError, DriveSessionExpired):
+                    pass
+                chunk_size = max(DRIVE_CHUNK_MIN, chunk_size // 2)
+                continue
+            raise
+
+        failures = 0
+        if res.get("done"):
+            pos = size
+            report(force=True)
+            return res.get("payload") or {}
+        new_pos = max(0, min(size, int(res.get("offset") or 0)))
+        if new_pos <= pos:
+            failures += 1
+            if failures > DRIVE_UPLOAD_RETRIES:
+                raise DriveTransientError("Google không xác nhận tiến độ upload")
+            time.sleep(min(30, 2 ** failures))
+            try:
+                st = _drive_session_status(session_url, size)
+                if st["done"]:
+                    report(force=True)
+                    return st.get("payload") or {}
+                new_pos = max(0, min(size, int(st.get("offset") or 0)))
+            except (DriveTransientError, DriveSessionExpired):
+                pass
+            chunk_size = max(DRIVE_CHUNK_MIN, chunk_size // 2)
+            continue
+        pos = new_pos
+        report(force=True)
+        if pos < size:
+            chunk_size = min(target_chunk, max(chunk_size, int(chunk_size * 1.35)))
+
+    st = _drive_session_status(session_url, size)
+    if st["done"]:
+        report(force=True)
+        return st.get("payload") or {}
+    raise DriveTransientError("Google chưa xác nhận upload hoàn tất")
 
 
 def drive_delete_file(file_id: str) -> bool:
@@ -8016,7 +8355,8 @@ def drive_process_row(row) -> str:
     g = gd_cfg()
     local_path = os.path.join(RECORDINGS_DIR, row["cam_id"], row["name"])
     if not os.path.exists(local_path):
-        conn.execute("UPDATE drive_uploads SET status='skipped', error='file đã bị xoá khỏi ổ cứng', updated=? WHERE path=?",
+        conn.execute("UPDATE drive_uploads SET status='skipped', error='file đã bị xoá khỏi ổ cứng', "
+                     "session_url='', session_size=0, uploaded=0, updated=? WHERE path=?",
                      (now, row["path"]))
         conn.commit()
         return "skipped"
@@ -8028,10 +8368,27 @@ def drive_process_row(row) -> str:
         parallel = max(1, min(DRIVE_MAX_PARALLEL, int(g.get("parallel_uploads") or 1)))
         if kbps > 0 and parallel > 1:
             kbps = max(64, kbps // parallel)
-        res = drive_upload_file(local_path, row["name"], folder_id, kbps)
+
+        def save_progress(uploaded: int, session_url: str, session_size: int):
+            try:
+                conn.execute("UPDATE drive_uploads SET uploaded=?, session_url=?, session_size=?, updated=? "
+                             "WHERE path=? AND status='uploading'",
+                             (int(uploaded), session_url, int(session_size), time.time(), row["path"]))
+                conn.commit()
+            except Exception:
+                pass
+
+        resume = {
+            "session_url": row["session_url"] if "session_url" in row.keys() else "",
+            "session_size": row["session_size"] if "session_size" in row.keys() else 0,
+            "uploaded": row["uploaded"] if "uploaded" in row.keys() else 0,
+        }
+        res = drive_upload_file(local_path, row["name"], folder_id, kbps,
+                                resume=resume, on_progress=save_progress)
         conn.execute(
-            "UPDATE drive_uploads SET status='done', error='', drive_id=?, size=?, tries=0, next_try=0, updated=? WHERE path=?",
-            (res.get("id") or "", size, now, row["path"]))
+            "UPDATE drive_uploads SET status='done', error='', drive_id=?, size=?, tries=0, next_try=0, "
+            "session_url='', session_size=0, uploaded=?, updated=? WHERE path=?",
+            (res.get("id") or "", size, size, now, row["path"]))
         conn.commit()
         if cam_drive_target(row["cam_id"]) == "drive" and row["path"] not in locked_paths():
             # Camera chỉ lưu trên Drive: xoá bản gốc trên ổ cứng sau khi tải xong
@@ -8063,6 +8420,11 @@ def drive_process_row(row) -> str:
             conn.execute("UPDATE drive_uploads SET status='pending', updated=? WHERE path=?", (now, row["path"]))
             conn.commit()
             return "pending"
+        if e.status not in (429, 500, 502, 503, 504):
+            # Lỗi metadata/phiên không thể sửa bằng cách gửi tiếp chunk cũ.
+            conn.execute("UPDATE drive_uploads SET session_url='', session_size=0, uploaded=0 WHERE path=?",
+                         (row["path"],))
+            conn.commit()
         return drive_mark_retry(conn, row, now, f"HTTP {e.status}: {payload[:200]}")
     except Exception as e:
         return drive_mark_retry(conn, row, now, str(e)[:200])
@@ -8227,7 +8589,7 @@ def get_drive():
             pass
     counts = drive_counts()
     recent = [dict(r) for r in conn.execute(
-        "SELECT path, cam_id, name, ts, size, status, error, updated FROM drive_uploads "
+        "SELECT path, cam_id, name, ts, size, status, error, uploaded, updated FROM drive_uploads "
         "ORDER BY updated DESC LIMIT 30").fetchall()]
     cameras = [{"id": cid, "name": (c or {}).get("name") or cid,
                 "storage_target": cam_drive_target(cid)}
@@ -8471,6 +8833,79 @@ def drive_retry_errors():
         "UPDATE drive_uploads SET status='pending', tries=0, next_try=0, error='' WHERE status='error'")
     db_conn().commit()
     return {"status": "ok", "requeued": cur.rowcount}
+
+def _drive_queue_item(cam_id: str, fname: str):
+    cam = os.path.basename(cam_id)
+    name = os.path.basename(fname)
+    if cam in ("", ".", "..") or name in ("", ".", ".."):
+        return "", None
+    rel = f"{cam}/{name}"
+    return rel, db_conn().execute(
+        "SELECT * FROM drive_uploads WHERE path=?", (rel,)).fetchone()
+
+@app.post("/api/drive/retry/{cam_id}/{fname}")
+def drive_retry_one(cam_id: str, fname: str):
+    rel, row = _drive_queue_item(cam_id, fname)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Không thấy file trong hàng đợi Drive")
+    if row["status"] == "uploading":
+        raise HTTPException(status_code=409, detail="File đang tải lên, không thể thử lại ngay")
+    if row["status"] == "done":
+        raise HTTPException(status_code=400, detail="File đã tải lên Drive")
+    local_path = os.path.join(RECORDINGS_DIR, os.path.basename(cam_id), os.path.basename(fname))
+    if not os.path.isfile(local_path):
+        raise HTTPException(status_code=400, detail="File gốc không còn trên ổ cứng")
+    conn = db_conn()
+    conn.execute("UPDATE drive_uploads SET status='pending', tries=0, next_try=0, error='', updated=? "
+                 "WHERE path=?", (time.time(), rel))
+    conn.commit()
+    log_event("info", f"Drive: thử lại {rel}", os.path.basename(cam_id))
+    return {"status": "ok", "path": rel}
+
+@app.post("/api/drive/skip/{cam_id}/{fname}")
+def drive_skip_one(cam_id: str, fname: str):
+    rel, row = _drive_queue_item(cam_id, fname)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Không thấy file trong hàng đợi Drive")
+    if row["status"] == "uploading":
+        raise HTTPException(status_code=409, detail="File đang tải lên, không thể bỏ qua ngay")
+    if row["status"] == "done":
+        raise HTTPException(status_code=400, detail="File đã tải lên Drive")
+    conn = db_conn()
+    conn.execute("UPDATE drive_uploads SET status='skipped', error='bỏ qua thủ công', "
+                 "session_url='', session_size=0, uploaded=0, updated=? WHERE path=?",
+                 (time.time(), rel))
+    conn.commit()
+    log_event("info", f"Drive: bỏ qua {rel}", os.path.basename(cam_id))
+    return {"status": "ok", "path": rel}
+
+@app.delete("/api/drive/item/{cam_id}/{fname}")
+def drive_delete_one(cam_id: str, fname: str):
+    rel, row = _drive_queue_item(cam_id, fname)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Không thấy file trong hàng đợi Drive")
+    if row["status"] == "uploading":
+        raise HTTPException(status_code=409, detail="File đang tải lên, không thể xoá ngay")
+    if row["status"] == "done":
+        raise HTTPException(status_code=400, detail="File đã tải lên Drive, không xoá tại đây")
+    local_path = os.path.join(RECORDINGS_DIR, os.path.basename(cam_id), os.path.basename(fname))
+    if rel in locked_paths():
+        raise HTTPException(status_code=409, detail="File đang được khoá")
+    deleted_file = False
+    if os.path.isfile(local_path):
+        if time.time() - os.path.getmtime(local_path) < 60:
+            raise HTTPException(status_code=409, detail="File vừa ghi xong, thử lại sau ít giây")
+        try:
+            os.remove(local_path)
+            deleted_file = True
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Không xoá được file gốc: {e}")
+    conn = db_conn()
+    conn.execute("DELETE FROM drive_uploads WHERE path=?", (rel,))
+    conn.commit()
+    log_event("info", f"Drive: xoá {rel} khỏi hàng đợi" + (" và file gốc" if deleted_file else ""),
+              os.path.basename(cam_id))
+    return {"status": "ok", "path": rel, "deleted_file": deleted_file}
 
 
 @app.post("/api/drive/disconnect")

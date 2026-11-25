@@ -2324,6 +2324,139 @@
       width: auto;
     }
 
+    .zone-editor {
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-elevated);
+      border-radius: var(--radius-sm);
+      padding: 10px;
+      margin-bottom: 14px;
+    }
+
+    .zone-head {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    .zone-head strong { font-size: 13px; }
+    .zone-hint {
+      color: var(--text-muted);
+      font-size: 12px;
+      line-height: 1.5;
+      margin-top: 3px;
+    }
+
+    .zone-count {
+      flex: none;
+      font-size: 11px;
+      color: var(--text-muted);
+      border: 1px solid var(--border-subtle);
+      border-radius: 999px;
+      padding: 2px 8px;
+      white-space: nowrap;
+    }
+
+    .zone-stage {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      overflow: hidden;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-subtle);
+      background:
+        linear-gradient(rgba(127, 127, 127, 0.12) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(127, 127, 127, 0.12) 1px, transparent 1px),
+        var(--bg-input);
+      background-size: 32px 32px, 32px 32px, auto;
+      cursor: crosshair;
+      touch-action: none;
+      user-select: none;
+    }
+
+    .zone-stage img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: fill;
+      display: none;
+      pointer-events: none;
+    }
+
+    .zone-boxes { position: absolute; inset: 0; }
+    .zone-box {
+      position: absolute;
+      border: 2px solid var(--ok-text);
+      background: rgba(16, 185, 129, 0.16);
+      border-radius: 5px;
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+      pointer-events: none;
+    }
+    .zone-box.zone-drawing {
+      border-style: dashed;
+      background: rgba(59, 130, 246, 0.18);
+      border-color: var(--info-text);
+    }
+    .zone-tag {
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      font-size: 10px;
+      font-weight: 700;
+      color: #fff;
+      background: rgba(4, 120, 87, 0.9);
+      border-radius: 4px;
+      padding: 1px 5px;
+    }
+    .zone-del {
+      position: absolute;
+      top: 3px;
+      right: 3px;
+      width: 22px;
+      height: 22px;
+      min-height: 22px;
+      padding: 0;
+      border-radius: 50%;
+      border: 0;
+      background: rgba(185, 28, 28, 0.9);
+      color: #fff;
+      font-size: 15px;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: auto;
+      cursor: pointer;
+    }
+    .zone-empty {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 12px;
+      color: var(--text-muted);
+      font-size: 12px;
+      pointer-events: none;
+    }
+    .zone-tools {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .zone-msg { font-size: 12px; color: var(--text-muted); }
+    .zone-badge {
+      min-width: 30px;
+      color: var(--ok-text);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
     .sec-tabs {
       display: flex;
       gap: 6px;
@@ -2352,6 +2485,13 @@
     }
 
     .audit-line .ts { color: var(--text-dim); flex: none; }
+    .drv-row-actions { display: flex; gap: 4px; flex: none; align-items: center; }
+    .drv-row-actions button {
+      padding: 2px 7px;
+      min-height: 24px;
+      font-size: 12px;
+      line-height: 1.2;
+    }
     .sec-warn { color: var(--warn-text); font-size: 13px; margin: 4px 0; }
     .sec-ok { color: var(--ok-text); font-size: 13px; margin: 4px 0; }
 
@@ -3058,6 +3198,30 @@
           <div id="schedRows"></div>
           <button style="margin-bottom:10px;" onclick="addSchedRow()">+ Thêm khung giờ</button>
 
+          <div class="zone-editor">
+            <div class="zone-head">
+              <div>
+                <strong>🎯 Vùng chuyển động (ROI)</strong>
+                <div class="zone-hint">Kéo chuột trên ảnh để vẽ vùng. Chỉ báo/ghi khi tâm đối tượng nằm trong vùng. API cần gửi thêm <code>bbox</code>; cảm biến HA không có toạ độ sẽ bỏ qua bộ lọc để tránh mất báo.</div>
+              </div>
+              <span class="zone-count" id="zoneCount">0 vùng</span>
+            </div>
+            <div class="zone-stage" id="zoneStage" role="img" aria-label="Khung vẽ vùng chuyển động"
+                 onpointerdown="zoneStart(event)" onpointermove="zoneMove(event)"
+                 onpointerup="zoneEnd(event)" onpointercancel="zoneEnd(event)">
+              <img id="zoneImg" alt="" draggable="false">
+              <div class="zone-boxes" id="zoneBoxes"></div>
+              <div class="zone-empty" id="zoneEmpty">Kéo chuột trên khung để vẽ vùng, hoặc bấm “Tải ảnh hiện tại”.</div>
+            </div>
+            <div class="zone-tools">
+              <button type="button" onclick="loadZoneSnapshot()">↻ Tải ảnh hiện tại</button>
+              <button type="button" onclick="addZoneRect()">+ Thêm vùng</button>
+              <button type="button" class="warn" onclick="clearZones()">Xoá hết</button>
+              <span class="zone-msg" id="zoneMsg" role="status" aria-live="polite"></span>
+            </div>
+            <div id="zoneRows"></div>
+          </div>
+
           <div class="form-row">
             <label>🛰️ Cảm biến chuyển động Home Assistant (chọn cảm biến và điều kiện kích hoạt; cần bật ở 🛰️ Home Assistant):</label>
           </div>
@@ -3469,6 +3633,16 @@
         <input id="ntPublicUrl" placeholder="http://192.168.5.63:9895">
       </div>
       <hr style="border:0; border-top:1px solid var(--border-subtle); margin:14px 0 12px;">
+      <h4 style="margin:0 0 8px;">🕒 Lịch nhận thông báo chuyển động</h4>
+      <label class="log-chk" style="font-size:13px; margin-bottom:6px;">
+        <input type="checkbox" id="ntSchedEnabled"> Chỉ gửi thông báo trong các khung giờ bên dưới
+      </label>
+      <div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:8px;">
+        Ngoài khung giờ, LiteNVR vẫn ghi hình và lưu sự kiện; chỉ tạm ẩn Telegram/webhook. Giờ theo máy chủ.
+      </div>
+      <div id="ntSchedRows"></div>
+      <button type="button" style="margin-bottom:10px;" onclick="addNotifySchedRow()">+ Thêm khung giờ</button>
+      <hr style="border:0; border-top:1px solid var(--border-subtle); margin:14px 0 12px;">
       <h4 style="margin:0 0 8px;">💽 Cảnh báo sức khoẻ ổ đĩa</h4>
       <label class="log-chk" style="font-size:13px; margin-bottom:10px;">
         <input type="checkbox" id="ntDiskAlert"> Bật cảnh báo khi ổ đĩa sắp đầy (qua Telegram/webhook)
@@ -3793,6 +3967,8 @@
     let storageReady = { drive: false, smb: false };
     let livePc = null, livePcSeq = 0;
     let editingCamId = null;
+    let camZones = [];
+    let zoneDrag = null;
     let _uiTimersStarted = false;
     let lastCursorSec = 0;
     let timelineZoom = 86400, timelineStart = 0, postMotionSec = 60, _tlViewKey = "";
@@ -4627,6 +4803,183 @@
       setCamMethod(method, true);
     }
 
+    function zoneClamp(v) {
+      v = Number(v);
+      return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0;
+    }
+
+    function normZoneRect(z) {
+      z = z || {};
+      let x = Math.min(0.99, zoneClamp(z.x));
+      let y = Math.min(0.99, zoneClamp(z.y));
+      let w = Math.max(0.01, Math.min(zoneClamp(z.w), 1 - x));
+      let h = Math.max(0.01, Math.min(zoneClamp(z.h), 1 - y));
+      return { x: +x.toFixed(4), y: +y.toFixed(4), w: +w.toFixed(4), h: +h.toFixed(4) };
+    }
+
+    function setZones(zones) {
+      camZones = (Array.isArray(zones) ? zones : []).map(normZoneRect)
+        .filter(z => z.w >= 0.01 && z.h >= 0.01).slice(0, 20);
+      zoneDrag = null;
+      drawZoneBoxes();
+      renderZoneRows();
+    }
+
+    function drawZoneBoxes() {
+      const boxes = document.getElementById("zoneBoxes");
+      const empty = document.getElementById("zoneEmpty");
+      const count = document.getElementById("zoneCount");
+      if (!boxes) return;
+      let html = camZones.map((z, i) => {
+        const left = (z.x * 100).toFixed(2), top = (z.y * 100).toFixed(2);
+        const width = (z.w * 100).toFixed(2), height = (z.h * 100).toFixed(2);
+        return `<div class="zone-box" style="left:${left}%;top:${top}%;width:${width}%;height:${height}%">
+          <span class="zone-tag">V${i + 1}</span>
+          <button type="button" class="zone-del" title="Xoá vùng ${i + 1}" aria-label="Xoá vùng ${i + 1}"
+                  onpointerdown="event.stopPropagation()" onclick="event.stopPropagation();removeZone(${i})">×</button>
+        </div>`;
+      }).join("");
+      if (zoneDrag) {
+        const x = Math.min(zoneDrag.x0, zoneDrag.x1), y = Math.min(zoneDrag.y0, zoneDrag.y1);
+        const w = Math.abs(zoneDrag.x1 - zoneDrag.x0), h = Math.abs(zoneDrag.y1 - zoneDrag.y0);
+        html += `<div class="zone-box zone-drawing" style="left:${(x * 100).toFixed(2)}%;top:${(y * 100).toFixed(2)}%;width:${(w * 100).toFixed(2)}%;height:${(h * 100).toFixed(2)}%"></div>`;
+      }
+      boxes.innerHTML = html;
+      if (empty) empty.style.display = camZones.length ? "none" : "flex";
+      if (count) count.textContent = camZones.length + " vùng";
+    }
+
+    function renderZoneRows() {
+      const rows = document.getElementById("zoneRows");
+      if (!rows) return;
+      rows.innerHTML = camZones.map((z, i) => `<div class="zone-row">
+        <span class="zone-badge">V${i + 1}</span>
+        <input type="number" min="0" max="99" step="1" value="${Math.round(z.x * 100)}"
+               data-k="x" aria-label="Vùng ${i + 1}: X phần trăm" title="X (%)"
+               oninput="zoneRowInput(${i},this)" onchange="renderZoneRows()">
+        <input type="number" min="0" max="99" step="1" value="${Math.round(z.y * 100)}"
+               data-k="y" aria-label="Vùng ${i + 1}: Y phần trăm" title="Y (%)"
+               oninput="zoneRowInput(${i},this)" onchange="renderZoneRows()">
+        <input type="number" min="1" max="100" step="1" value="${Math.round(z.w * 100)}"
+               data-k="w" aria-label="Vùng ${i + 1}: rộng phần trăm" title="Rộng (%)"
+               oninput="zoneRowInput(${i},this)" onchange="renderZoneRows()">
+        <input type="number" min="1" max="100" step="1" value="${Math.round(z.h * 100)}"
+               data-k="h" aria-label="Vùng ${i + 1}: cao phần trăm" title="Cao (%)"
+               oninput="zoneRowInput(${i},this)" onchange="renderZoneRows()">
+        <button type="button" title="Xoá vùng ${i + 1}" onclick="removeZone(${i})">✖</button>
+      </div>`).join("");
+    }
+
+    function zoneRowInput(i, el) {
+      if (!camZones[i]) return;
+      const k = el.dataset.k;
+      const v = parseFloat(el.value);
+      if (!Number.isFinite(v)) return;
+      camZones[i] = normZoneRect({ ...camZones[i], [k]: v / 100 });
+      drawZoneBoxes();
+    }
+
+    function removeZone(i) {
+      camZones.splice(i, 1);
+      drawZoneBoxes();
+      renderZoneRows();
+    }
+
+    function addZoneRect() {
+      if (camZones.length >= 20) return alert("Tối đa 20 vùng mỗi camera.");
+      const n = camZones.length;
+      camZones.push(normZoneRect({ x: 0.12 + (n % 3) * 0.16, y: 0.12 + Math.floor(n / 3) * 0.14, w: 0.32, h: 0.32 }));
+      drawZoneBoxes();
+      renderZoneRows();
+    }
+
+    function clearZones() {
+      if (camZones.length && !confirm("Xoá tất cả vùng chuyển động của camera này?")) return;
+      setZones([]);
+      const msg = document.getElementById("zoneMsg");
+      if (msg) msg.textContent = "Đã xoá vùng.";
+    }
+
+    function zonePoint(event) {
+      const stage = document.getElementById("zoneStage");
+      const r = stage.getBoundingClientRect();
+      return { x: zoneClamp((event.clientX - r.left) / (r.width || 1)),
+               y: zoneClamp((event.clientY - r.top) / (r.height || 1)) };
+    }
+
+    function zoneStart(event) {
+      if (event.button !== 0 && event.pointerType === "mouse") return;
+      if (event.target.closest(".zone-del")) return;
+      const p = zonePoint(event);
+      zoneDrag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+      try { event.currentTarget.setPointerCapture(event.pointerId); } catch (e) {}
+      drawZoneBoxes();
+    }
+
+    function zoneMove(event) {
+      if (!zoneDrag) return;
+      const p = zonePoint(event);
+      zoneDrag.x1 = p.x;
+      zoneDrag.y1 = p.y;
+      drawZoneBoxes();
+    }
+
+    function zoneEnd(event) {
+      if (!zoneDrag) return;
+      const z = normZoneRect({
+        x: Math.min(zoneDrag.x0, zoneDrag.x1), y: Math.min(zoneDrag.y0, zoneDrag.y1),
+        w: Math.abs(zoneDrag.x1 - zoneDrag.x0), h: Math.abs(zoneDrag.y1 - zoneDrag.y0)
+      });
+      zoneDrag = null;
+      if (z.w >= 0.02 && z.h >= 0.02 && z.x + z.w <= 1.001 && z.y + z.h <= 1.001) {
+        if (camZones.length < 20) camZones.push(z);
+      }
+      drawZoneBoxes();
+      renderZoneRows();
+    }
+
+    function resetZoneEditor() {
+      camZones = [];
+      zoneDrag = null;
+      const img = document.getElementById("zoneImg");
+      if (img) { img.removeAttribute("src"); img.style.display = "none"; }
+      const stage = document.getElementById("zoneStage");
+      if (stage) stage.style.aspectRatio = "16 / 9";
+      const msg = document.getElementById("zoneMsg");
+      if (msg) msg.textContent = "";
+      drawZoneBoxes();
+      renderZoneRows();
+    }
+
+    function loadZoneSnapshot() {
+      const id = editingCamId || document.getElementById("inpCamId").value.trim();
+      const img = document.getElementById("zoneImg");
+      const msg = document.getElementById("zoneMsg");
+      if (!img || !msg) return;
+      if (!id) {
+        msg.style.color = "var(--text-muted)";
+        msg.textContent = "Chưa có mã camera để tải ảnh — vẫn có thể vẽ vùng.";
+        return;
+      }
+      msg.style.color = "var(--text-muted)";
+      msg.textContent = "⏳ Đang tải ảnh...";
+      img.onload = () => {
+        img.style.display = "block";
+        const stage = document.getElementById("zoneStage");
+        if (stage && img.naturalWidth && img.naturalHeight) {
+          stage.style.aspectRatio = img.naturalWidth + " / " + img.naturalHeight;
+        }
+        msg.style.color = "var(--ok-text)";
+        msg.textContent = "✔ Ảnh hiện tại (có thể kéo để vẽ lại vùng)";
+      };
+      img.onerror = () => {
+        img.style.display = "none";
+        msg.style.color = "var(--warn-text)";
+        msg.textContent = "Chưa có ảnh snapshot — vẫn có thể vẽ vùng trên khung.";
+      };
+      img.src = `api/cameras/${encodeURIComponent(id)}/snapshot.jpg?t=${Date.now()}`;
+    }
+
     function resetCamForm() {
       editingCamId = null;
       const idInput = document.getElementById("inpCamId");
@@ -4648,6 +5001,7 @@
       document.getElementById("inpSchedEnabled").checked = false;
       document.getElementById("schedRows").innerHTML = "";
       document.getElementById("camHassRows").innerHTML = "";
+      resetZoneEditor();
       const testOut = document.getElementById("camTestResult");
       if (testOut) testOut.textContent = "";
       const adv = document.getElementById("camAdvanced");
@@ -4697,12 +5051,15 @@
       const rows = document.getElementById("schedRows");
       rows.innerHTML = "";
       (c.schedule || []).forEach(w => addSchedRow(w));
+      setZones(c.motion_zones || []);
+      loadZoneSnapshot();
       const hrows = document.getElementById("camHassRows");
       hrows.innerHTML = "";
       (c.hass_entities || []).forEach(ent => addCamHassRow(ent));
       ensureHassSensors();
       const adv = document.getElementById("camAdvanced");
-      if (adv) adv.open = !!(c.schedule_enabled || (c.schedule || []).length || (c.hass_entities || []).length);
+      if (adv) adv.open = !!(c.schedule_enabled || (c.schedule || []).length ||
+                             (c.hass_entities || []).length || (c.motion_zones || []).length);
       setCamMethod("manual");
     }
 
@@ -4944,6 +5301,7 @@
         tags: document.getElementById("inpTags").value.trim(),
         schedule_enabled: document.getElementById("inpSchedEnabled").checked,
         schedule: readSchedRows(),
+        motion_zones: camZones.map(z => ({ ...z })),
         hass_entities: readCamHassRows()
       };
       if (!payload.cam_id || !payload.name || !payload.rtsp_url) {
@@ -7229,6 +7587,31 @@
     }
 
     // ================= Thông báo (Telegram/Webhook) =================
+    function addNotifySchedRow(w) {
+      w = w || {};
+      const days = (w.days || []).map(d => d + 1).join(",");
+      const div = document.createElement("div");
+      div.className = "sched-row nt-sched-row";
+      div.innerHTML = `<input class="s-days nt-s-days" placeholder="Thứ (1=T2 … 7=CN; trống=mọi ngày)" value="${days}">
+        <input type="time" class="nt-s-from" value="${w.from || "22:00"}">
+        <span>→</span>
+        <input type="time" class="nt-s-to" value="${w.to || "06:00"}">
+        <button type="button" title="Xoá khung giờ" onclick="this.parentNode.remove()">✖</button>`;
+      document.getElementById("ntSchedRows").appendChild(div);
+    }
+
+    function readNotifySchedRows() {
+      return [...document.querySelectorAll("#ntSchedRows .nt-sched-row")].map(r => {
+        const days = r.querySelector(".nt-s-days").value.split(",")
+          .map(s => parseInt(s.trim(), 10)).filter(n => n >= 1 && n <= 7).map(n => n - 1);
+        return {
+          days,
+          from: r.querySelector(".nt-s-from").value || "00:00",
+          to: r.querySelector(".nt-s-to").value || "23:59"
+        };
+      });
+    }
+
     async function openNotifyModal() {
       const cfg = await fetch("api/notify").then(r => r.json());
       document.getElementById("ntEnabled").checked = !!cfg.telegram_enabled;
@@ -7240,6 +7623,10 @@
       document.getElementById("ntClipSec").value = cfg.telegram_clip_sec || 8;
       document.getElementById("ntWebhook").value = cfg.webhook_url || "";
       document.getElementById("ntPublicUrl").value = cfg.public_url || "";
+      document.getElementById("ntSchedEnabled").checked = !!cfg.notify_schedule_enabled;
+      const schedRows = document.getElementById("ntSchedRows");
+      schedRows.innerHTML = "";
+      (cfg.notify_schedule || []).forEach(w => addNotifySchedRow(w));
       document.getElementById("ntCamOffline").checked = cfg.camera_offline_alert !== false;
       document.getElementById("ntDiskAlert").checked = !!cfg.disk_alert_enabled;
       document.getElementById("ntDiskWarn").value = cfg.disk_warn_percent || 85;
@@ -7281,7 +7668,9 @@
         camera_offline_alert: document.getElementById("ntCamOffline").checked,
         disk_alert_enabled: document.getElementById("ntDiskAlert").checked,
         disk_warn_percent: parseFloat(document.getElementById("ntDiskWarn").value) || 85,
-        disk_crit_percent: parseFloat(document.getElementById("ntDiskCrit").value) || 95
+        disk_crit_percent: parseFloat(document.getElementById("ntDiskCrit").value) || 95,
+        notify_schedule_enabled: document.getElementById("ntSchedEnabled").checked,
+        notify_schedule: readNotifySchedRows()
       };
       const r = await fetch("api/notify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
       const st = document.getElementById("ntStatus");
@@ -8322,11 +8711,37 @@
         const color = r.status === "done" ? "var(--ok-text)" : r.status === "error" ? "var(--err-text)"
                     : r.status === "deleted" ? "var(--text-dim)" : r.status === "skipped" ? "var(--text-dim)" : "var(--warn-text)";
         const camName = (d.cameras_all.find(x => x.id === r.cam_id) || {}).name || r.cam_id;
-        return `<div class="audit-line"><span class="ts" style="flex:none;">${new Date((r.ts || 0) * 1000).toLocaleString("vi-VN")}</span>`
-          + `<span style="flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(camName)} · ${esc(r.name)}</span>`
+        const pct = r.status === "uploading" && r.size > 0
+          ? ` ${Math.max(0, Math.min(100, Math.round((r.uploaded || 0) * 100 / r.size)))}%` : "";
+        const acts = [];
+        if (r.status === "error" || r.status === "skipped") {
+          acts.push(`<button type="button" data-drv-act="retry" title="Thử lại file này" aria-label="Thử lại ${esc(r.name)}">🔁</button>`);
+        }
+        if (r.status === "error" || r.status === "pending") {
+          acts.push(`<button type="button" data-drv-act="skip" title="Bỏ qua file này" aria-label="Bỏ qua ${esc(r.name)}">✕</button>`);
+        }
+        if (r.status === "error" || r.status === "skipped" || r.status === "pending") {
+          acts.push(`<button type="button" data-drv-act="delete" class="warn" title="Xoá file gốc và bỏ khỏi hàng đợi" aria-label="Xoá ${esc(r.name)}">🗑</button>`);
+        }
+        return `<div class="audit-line" data-cam="${esc(r.cam_id)}" data-name="${esc(r.name)}">`
+          + `<span class="ts" style="flex:none;">${new Date((r.ts || 0) * 1000).toLocaleString("vi-VN")}</span>`
+          + `<span style="flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(r.name)}">${esc(camName)} · ${esc(r.name)}</span>`
           + `<span style="flex:none;">${drvFmtBytes(r.size)}</span>`
-          + `<span style="flex:none;color:${color};" title="${esc(r.error || "")}">${st}</span></div>`;
+          + `<span style="flex:none;color:${color};" title="${esc(r.error || "")}">${st}${pct}</span>`
+          + (acts.length ? `<span class="drv-row-actions">${acts.join("")}</span>` : "")
+          + `</div>`;
       }).join("") : '<div style="padding:10px;color:var(--text-dim);font-size:12.5px;">Chưa có file nào được đưa lên Drive.</div>';
+      rec.querySelectorAll("button[data-drv-act]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const row = btn.closest(".audit-line");
+          if (!row) return;
+          const cam = row.dataset.cam || "";
+          const name = row.dataset.name || "";
+          if (btn.dataset.drvAct === "retry") driveRetryOne(cam, name);
+          else if (btn.dataset.drvAct === "delete") driveDeleteOne(cam, name);
+          else driveSkipOne(cam, name);
+        });
+      });
     }
 
     async function driveConnectStart() {
@@ -8430,6 +8845,33 @@
       const r = await fetch("api/drive/retry", { method: "POST" });
       const d = await r.json().catch(() => ({}));
       drvMsg(r.ok ? ("🔁 Đã đưa " + (d.requeued || 0) + " file lỗi về hàng đợi.") : "❌ Lỗi thử lại", !r.ok);
+      loadDrive();
+    }
+    async function driveRetryOne(cam, name) {
+      if (!cam || !name) return;
+      const r = await fetch("api/drive/retry/" + encodeURIComponent(cam) + "/" + encodeURIComponent(name),
+                            { method: "POST" });
+      const d = await r.json().catch(() => ({}));
+      drvMsg(r.ok ? ("🔁 Đã thử lại " + name + ".") : ("❌ " + (d.detail || r.status)), !r.ok);
+      loadDrive();
+    }
+    async function driveSkipOne(cam, name) {
+      if (!cam || !name) return;
+      if (!confirm("Bỏ qua file này? File gốc trên ổ cứng vẫn được giữ nguyên.")) return;
+      const r = await fetch("api/drive/skip/" + encodeURIComponent(cam) + "/" + encodeURIComponent(name),
+                            { method: "POST" });
+      const d = await r.json().catch(() => ({}));
+      drvMsg(r.ok ? ("✕ Đã bỏ qua " + name + ".") : ("❌ " + (d.detail || r.status)), !r.ok);
+      loadDrive();
+    }
+    async function driveDeleteOne(cam, name) {
+      if (!cam || !name) return;
+      if (!confirm("Xoá file gốc trên ổ cứng và bỏ khỏi hàng đợi Drive?\nKhông thể hoàn tác.")) return;
+      const r = await fetch("api/drive/item/" + encodeURIComponent(cam) + "/" + encodeURIComponent(name),
+                            { method: "DELETE" });
+      const d = await r.json().catch(() => ({}));
+      drvMsg(r.ok ? ("🗑 Đã xoá " + name + (d.deleted_file ? " và file gốc." : " khỏi hàng đợi."))
+                  : ("❌ " + (d.detail || r.status)), !r.ok);
       loadDrive();
     }
 

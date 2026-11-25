@@ -90,11 +90,13 @@ MQTT Discovery chỉ gửi ảnh snapshot. Để xem live trong HA, dùng **Gene
 Gửi sự kiện từ bộ nhận diện AI bất kỳ (Frigate, DeepStack, CodeProject.AI, Node-RED…) vào endpoint:
 ```
 POST /api/ai/detect
-{"cam_id":"cam_cong","objects":["person","car"],"snapshot_url":"http://detector/snap.jpg"}
+{"cam_id":"cam_cong","objects":["person","car"],"snapshot_url":"http://detector/snap.jpg",
+ "bbox":[0.42,0.31,0.58,0.74]}
 ```
 - `objects`: tên đối tượng tiếng Anh (`person`, `car`, `truck`, `motorcycle`, `bicycle`, `dog`, `cat`, `package`…), LiteNVR **tự dịch sang tiếng Việt** (`Người`, `Xe`, `Xe tải`…) và gộp thành nhãn `AI: Người, Xe`.
 - `snapshot_url` (tuỳ chọn): LiteNVR tải ảnh này làm ảnh sự kiện (bỏ qua chụp từ luồng); chỉ nhận `http/https`, tối đa 8 MB. Không có thì tự chụp như sự kiện chuyển động thường.
 - `label` (tuỳ chọn): ghi đè nhãn.
+- `bbox` (tuỳ chọn): `[x1,y1,x2,y2]` chuẩn hoá `0..1`, dùng để lọc **vùng chuyển động (ROI)** của camera. Không gửi `bbox` thì sự kiện vẫn được nhận (tránh mất báo từ cảm biến HA đời cũ).
 Sự kiện AI đi đúng luồng cũ: kích hoạt ghi hình, lưu vào danh sách sự kiện (tìm kiếm được theo nhãn/camera/ngày) và gửi thông báo (Telegram/webhook) nếu đã bật. Endpoint dùng chung quyền `live` nên client HTTP Basic (script/HA/Frigate) gọi được.
 
 ## Mô tả sự kiện bằng AI (Gemini / OpenAI / Groq / custom)
@@ -201,8 +203,10 @@ Nguyên nhân phổ biến: camera dùng **H.265/HEVC** — trình duyệt (Chro
 - **🔒 Khoá bản ghi**: di con trỏ tới đoạn cần giữ rồi bấm **🔒 Khoá đoạn** — file này **không bao giờ bị xoá tự động** (theo ngày lưu, giới hạn GB hay % ổ cứng). Bấm **🔓 Mở khoá** để cho phép xoá lại.
 - **⬇️ Xuất clip**: chọn *Từ giờ → Đến giờ* dưới thanh thời gian rồi bấm **Tải đoạn** để tải một file MP4 gồm toàn bộ các đoạn ghi trong khoảng đó. Nút **⬇️** trên mỗi sự kiện tải nhanh clip quanh sự kiện (mặc định 10s trước + 60s sau). Bật **chuyển H.264** nếu muốn gửi clip cho thiết bị/tài khoản không phát được H.265.
 - **📅 Lịch ghi hình**: trong phần sửa camera, bật **Lịch ghi hình** và thêm các khung giờ (Thứ, Từ, Đến, chế độ 24/7 hay Motion). Ngoài mọi khung giờ, camera **không ghi** (vẫn xem live được). Hỗ trợ khung giờ qua đêm (VD 22:00 → 06:00). Ví dụ: ngày thường chỉ Motion 8h–17h, ban đêm 24/7.
+- **🎯 Vùng chuyển động (ROI)**: trong **Tùy chọn nâng cao** của camera, bấm **↻ Tải ảnh hiện tại** rồi kéo chuột để vẽ vùng; có thể chỉnh X/Y/rộng/cao theo % hoặc xoá từng vùng. Chỉ sự kiện có **tâm bbox** nằm trong vùng mới kích hoạt ghi hình/thông báo. API `/api/motion` và `/api/ai/detect` nhận thêm `bbox` dạng `[x1,y1,x2,y2]` (0..1); cảm biến HA không có toạ độ sẽ **bỏ qua bộ lọc** để không mất báo.
 - **🎮 PTZ (ONVIF)**: bấm **🎮 PTZ** để hiện bàn điều hướng xoay/zoom (dùng tài khoản trong URL RTSP; camera cần hỗ trợ ONVIF). Chọn preset có sẵn trong danh sách và bấm **📍 Đến preset**. Nếu camera dùng cổng ONVIF khác 80, thêm `onvif_port` trong `config.json`.
 - **Thông báo Telegram/Webhook**: bấm **Thông báo**, dán **Bot Token** (tạo bot qua @BotFather), **Chat ID** và bật thông báo — mỗi khi có chuyển động, LiteNVR gửi tin kèm **ảnh snapshot** hoặc **video ngắn** (tuỳ chọn) và mô tả AI nếu đã bật. Ô **Webhook URL** cho phép đẩy JSON sang Node-RED/HA/n8n (miễn phí). Nút **Gửi thử** để kiểm tra; tin nhắn giới hạn 1 tin/3 giây mỗi camera để tránh dội. Điền **Địa chỉ LiteNVR** (VD `http://192.168.5.63:9895`) để tin nhắn/webhook kèm **link Xem lại** mở đúng camera + thời điểm sự kiện (giao diện tự đọc `?cam=&date=&t=`). Telegram cần license Pro còn hiệu lực.
+- **🕒 Lịch nhận thông báo**: trong hộp thoại **Thông báo**, bật **Chỉ gửi thông báo trong các khung giờ bên dưới** và thêm khung giờ theo Thứ/Từ/Đến (hỗ trợ qua đêm). Ngoài khung giờ, LiteNVR **vẫn ghi hình và lưu sự kiện**, chỉ tạm ẩn Telegram/webhook; cảnh báo sức khoẻ ổ đĩa và camera offline không bị ẩn.
 - **💾 Sao lưu / Khôi phục cấu hình**: trong **⚙️ Lưu trữ**, bấm **Xuất cấu hình** để tải file JSON (camera, lịch, HA, thông báo) và **Nhập cấu hình** để khôi phục sau khi chạy container mới / khôi phục nguyên trạng.
 - **📱 Tối ưu điện thoại / máy tính bảng**: giao diện tự gọn thanh công cụ thành nút **☰** trên màn hình nhỏ, modal mở toàn màn hình, nút/ô nhập đủ lớn cho cảm ứng (ô nhập ≥16px, chống iOS tự phóng to), timeline cao hơn để kéo tua dễ hơn.
 
@@ -231,7 +235,9 @@ Bấm **💾 Lưu trữ ngoài (SMB/FTP)** (admin) để tự động chuyển c
 API timeline nhận thêm `source=auto|local|drive|smb`: `GET /api/timeline/<cam_id>?date=YYYY-MM-DD&source=drive`.
 
 ## Sao lưu 24/7 lên Google Drive (tự dọn khi đầy)
-Bấm **☁️ Google Drive** (chỉ tài khoản admin) để bật tính năng: mọi đoạn ghi hoàn chỉnh sẽ **tự động tải lên Drive 24/7** vào thư mục `LiteNVR/YYYY-MM-DD/<tên camera>` (tự tạo, chia theo ngày cho dễ tìm). Khi Drive đầy, LiteNVR **tự xoá các file cũ nhất do chính nó tải lên** (xoá vĩnh viễn, không vào thùng rác, để giải phóng dung lượng ngay) rồi tiếp tục tải. File đang được ghi sẽ không bị đụng tới; file lỗi được **thử lại tự động** (5 lần, chờ tăng dần).
+Bấm **☁️ Google Drive** (chỉ tài khoản admin) để bật tính năng: mọi đoạn ghi hoàn chỉnh sẽ **tự động tải lên Drive 24/7** vào thư mục `LiteNVR/YYYY-MM-DD/<tên camera>` (tự tạo, chia theo ngày cho dễ tìm). Khi Drive đầy, LiteNVR **tự xoá các file cũ nhất do chính nó tải lên** (xoá vĩnh viễn, không vào thùng rác, để giải phóng dung lượng ngay) rồi tiếp tục tải. File đang được ghi sẽ không bị đụng tới.
+
+Upload dùng **resumable session** của Google Drive: nếu mạng rớt/timeout, LiteNVR lưu `session_url` + offset vào SQLite và **tải tiếp đúng chunk** thay vì bắt đầu lại; chunk tự tăng/giảm theo tốc độ mạng (256 KB–32 MB), có timeout và retry. Danh sách gần đây hiện **% tiến trình** và nút **🔁 thử lại**, **✕ bỏ qua**, **🗑 xoá file gốc + khỏi hàng đợi** cho từng file. API: `POST /api/drive/retry/<cam>/<fname>`, `POST /api/drive/skip/<cam>/<fname>`, `DELETE /api/drive/item/<cam>/<fname>`.
 
 **Cách kết nối Google (làm 1 lần):**
 1. Vào [console.cloud.google.com](https://console.cloud.google.com) → tạo Project → **APIs & Services → Library** → bật **Google Drive API**.
@@ -268,8 +274,9 @@ rest_command:
     username: "admin"
     password: "admin"
     content_type: "application/json"
-    payload: '{"cam_id":"cam_cong","label":"Chuyển động (HASS)"}'
+    payload: '{"cam_id":"cam_cong","label":"Chuyển động (HASS)","bbox":[0.42,0.31,0.58,0.74]}'
 ```
+`bbox` là tuỳ chọn; bỏ trống nếu cảm biến không có toạ độ. Khi camera có **vùng chuyển động (ROI)**, chỉ sự kiện có tâm bbox nằm trong vùng mới kích hoạt ghi hình/thông báo; sự kiện không có bbox vẫn được nhận.
 
 ## Cách đưa lên GitHub để tự động đóng gói Docker Image (`ghcr.io`)
 1. Tạo 1 Repository mới ở chế độ **Public** trên GitHub của bạn với tên `litenvr`.
