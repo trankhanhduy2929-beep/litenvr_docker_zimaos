@@ -1761,6 +1761,8 @@ class BuilderTests(unittest.TestCase):
     def test_only_required_sources(self):
         base = self.m.build_ffmpeg_cmd("cam", self._cam(record_mode="continuous", video_codec="copy"), include_live=False)
         self.assertEqual(base.count("-i"), 1)
+        self.assertEqual(self._values(base, "-segment_time"), ["60"])
+        self.assertEqual(self._values(base, "-break_non_keyframes"), ["1"])
         off = self.m.build_ffmpeg_cmd("cam", self._cam(record_mode="off", video_codec="copy"), include_live=True)
         self.assertEqual(off.count("-i"), 1)
         self.assertIn("sub", off[off.index("-i") + 1])
@@ -2325,6 +2327,25 @@ class LifecycleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.sandbox, cls.m = load_app()
+
+    def test_recording_overflow_detects_long_active_segment(self):
+        m = self.m
+        cam = "cam-rec-overflow"
+        d = os.path.join(m.RECORDINGS_DIR, cam)
+        os.makedirs(d, exist_ok=True)
+        now = time.time()
+        name = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(now - 600)) + ".mp4"
+        path = os.path.join(d, name)
+        with open(path, "wb") as f:
+            f.write(b"x" * 1024)
+        os.utime(path, (now, now))
+        try:
+            self.assertEqual(m._recording_overflow(cam, now=now, max_sec=180, max_bytes=10**9), path)
+            self.assertIsNone(m._recording_overflow(cam, now=now, max_sec=900, max_bytes=10**9))
+            os.utime(path, (now - 120, now - 120))
+            self.assertIsNone(m._recording_overflow(cam, now=now, max_sec=180, max_bytes=10**9))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
     def test_terminate_process_reaps(self):
         proc = subprocess.Popen([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, lambda *a: None); time.sleep(60)"])

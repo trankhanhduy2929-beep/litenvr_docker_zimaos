@@ -42,7 +42,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.26").strip() or "1.9.26"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.27").strip() or "1.9.27"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -1238,6 +1238,10 @@ LIVE_TRANSCODE_MAX_HEIGHT = int(os.environ.get("LIVE_TRANSCODE_MAX_HEIGHT", "576
 # Tăng LIVE_HLS_TIME/LIVE_HLS_LIST nếu mạng Wi-Fi yếu hoặc camera có GOP dài.
 LIVE_HLS_TIME = max(1, min(10, int(os.environ.get("LIVE_HLS_TIME", "1") or "1")))
 LIVE_HLS_LIST = max(3, min(20, int(os.environ.get("LIVE_HLS_LIST", "4") or "4")))
+# Chặn file ghi hình phình to khi nguồn không phát keyframe đúng hoặc PTS đứng.
+# 0 = tắt; mặc định tối đa 3 phút hoặc 256MB cho mỗi file đang ghi.
+REC_MAX_FILE_SEC = int(os.environ.get("NVR_REC_MAX_FILE_SEC", "180") or "0")
+REC_MAX_FILE_MB = int(os.environ.get("NVR_REC_MAX_FILE_MB", "256") or "0")
 # Theo dõi cảnh báo đầy ổ (tránh spam log)
 _disk_warn = {"t": 0.0}
 _disk_paused = {"low": False}
@@ -2437,6 +2441,7 @@ def build_ffmpeg_cmd(cam_id: str, cam_info: dict, video_codec: Optional[str] = N
         cmd.extend([
             "-f", "segment",
             "-segment_time", seg_time,
+            "-break_non_keyframes", "1",
             "-reset_timestamps", "1",
             "-strftime", "1",
             os.path.join(target_dir, "%Y-%m-%d_%H-%M-%S.mp4")
@@ -3027,6 +3032,20 @@ def live_supervisor():
             for cam_id, cam in list(CONFIG.get("cameras", {}).items()):
                 st = cam_status.get(cam_id, {})
                 sched = schedule_record_mode(cam)
+                # Chốt an toàn: nếu segment muxer không cắt được (nguồn HEVC thiếu
+                # keyframe/PTS đứng), chủ động restart ffmpeg để mở file mới.
+                if (not low and sched == "continuous" and st.get("running")
+                        and not st.get("_disk_live_only")
+                        and now - st.get("_rec_guard_ts", 0) >= 20):
+                    st["_rec_guard_ts"] = now
+                    proc = ffmpeg_processes.get(cam_id)
+                    if proc and proc.poll() is None:
+                        over = _recording_overflow(cam_id, now=now)
+                        if over:
+                            log_event("warn",
+                                      f"File ghi hình quá dài/lớn, tách segment: {os.path.basename(over)}",
+                                      cam_id)
+                            _restart_camera_process(cam_id, proc, immediate=True)
                 if low and sched != "off":
                     # Ổ đầy: dừng nhánh ghi hình, nhưng vẫn giữ live cho người đang xem.
                     # Worker tự chạy live-only khi thấy disk_low (xem _worker_modes).
@@ -7780,6 +7799,45 @@ def _rec_name_ts(name: str) -> Optional[float]:
         return datetime(y, mo, d, h, mi, s).timestamp()
     except Exception:
         return None
+
+def _recording_overflow(cam_id: str, now: float | None = None,
+                        max_sec: float | None = None,
+                        max_bytes: int | None = None) -> str | None:
+    """Trả về file bản ghi đang được ghi nếu vượt giới hạn thời lượng/kích thước.
+
+    Dùng làm chốt an toàn khi ffmpeg không cắt segment được vì nguồn HEVC thiếu
+    keyframe hoặc timestamp đứng. File đã đóng (mtime cũ) không bị coi là đang ghi.
+    """
+    now = time.time() if now is None else now
+    max_sec = REC_MAX_FILE_SEC if max_sec is None else max_sec
+    max_bytes = REC_MAX_FILE_MB * 1024 * 1024 if max_bytes is None else max_bytes
+    if not max_sec and not max_bytes:
+        return None
+    cam_dir = os.path.join(RECORDINGS_DIR, os.path.basename(cam_id))
+    newest = None
+    newest_ts = 0.0
+    try:
+        with os.scandir(cam_dir) as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                ts = _rec_name_ts(entry.name)
+                if ts is not None and ts >= newest_ts:
+                    newest_ts = ts
+                    newest = entry.path
+    except OSError:
+        return None
+    if not newest:
+        return None
+    try:
+        st = os.stat(newest)
+    except OSError:
+        return None
+    if now - st.st_mtime > 30:
+        return None
+    if (max_sec and now - newest_ts >= max_sec) or (max_bytes and st.st_size >= max_bytes):
+        return newest
+    return None
 
 
 def drive_scan_once():
