@@ -42,7 +42,7 @@ mimetypes.add_type("video/mp2t", ".ts")
 NVR_USER = os.environ.get("NVR_USER", "admin")
 NVR_PASS = os.environ.get("NVR_PASS", "admin")
 AUTH_ENABLED = os.environ.get("NVR_AUTH", "on").lower() not in ("off", "0", "false", "no")
-APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.27").strip() or "1.9.27"
+APP_VERSION = (os.environ.get("LITENVR_VERSION") or "1.9.28").strip() or "1.9.28"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_CAND = os.path.join(BASE_DIR, "static")
@@ -2649,6 +2649,17 @@ def health_snapshot() -> Dict[str, dict]:
     return out
 
 
+def _mark_cam_health_stopped(cam_id: str):
+    """Không giữ fps/trạng thái cũ của worker đã dừng trong thống kê."""
+    h = cam_health.get(cam_id)
+    if not h:
+        return
+    h["fps"] = None
+    h["stalled"] = False
+    h["state"] = "stopped"
+    h["last_frame_at"] = None
+
+
 # Tự khởi động lại ffmpeg nếu RSS vượt ngưỡng (chống rò rỉ/4K transcode quá nặng).
 # 0 = tắt. Chỉ áp dụng sau thời gian grace để tránh restart lúc ffmpeg mới khởi động.
 CAMERA_MAX_RSS_MB = max(0, int(os.environ.get("CAMERA_MAX_RSS_MB", "640") or "0"))
@@ -2967,6 +2978,7 @@ def _camera_worker_loop(cam_id: str, token: threading.Event):
         if worker_tokens.get(cam_id) is token:
             worker_tokens.pop(cam_id, None)
             st["running"] = False
+            _mark_cam_health_stopped(cam_id)
             cleared = True
     if cleared:
         _clear_hls_playlist(cam_id)
@@ -2986,6 +2998,7 @@ def stop_camera_worker(cam_id: str):
         st["stop_reason"] = "stopped"
         st["last_error"] = ""
         st["last_warning"] = ""
+        _mark_cam_health_stopped(cam_id)
 
 
 def _restart_camera_process(cam_id: str, proc, immediate: bool = False):
@@ -3572,6 +3585,8 @@ def check_corrupt_recordings():
                 mtime = os.path.getmtime(fp)
             except Exception:
                 continue
+            if now - mtime < 60:
+                continue  # đang ghi hoặc vừa chốt, chưa đủ ổn định để kiểm tra header
             if size == 0:
                 if now - mtime > 60:
                     try:

@@ -2347,6 +2347,48 @@ class LifecycleTests(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_corrupt_check_skips_active_recordings(self):
+        m = self.m
+        cam = "cam-corrupt-active"
+        old_cams = m.CONFIG.get("cameras")
+        m.CONFIG["cameras"] = {cam: {"name": cam, "rtsp_url": "rtsp://127.0.0.1:1/x",
+                                     "record_mode": "continuous"}}
+        d = os.path.join(m.RECORDINGS_DIR, cam)
+        os.makedirs(d, exist_ok=True)
+        now = time.time()
+        name = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(now)) + ".mp4"
+        path = os.path.join(d, name)
+        with open(path, "wb") as f:
+            f.write(b"x")
+        os.utime(path, (now, now))
+        try:
+            _removed, bad = m.check_corrupt_recordings()
+            self.assertEqual(bad, 0)
+            os.utime(path, (now - 120, now - 120))
+            _removed, bad = m.check_corrupt_recordings()
+            self.assertEqual(bad, 1)
+        finally:
+            m.CONFIG["cameras"] = old_cams
+            m.cam_status.pop("_system", None)
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_health_snapshot_clears_fps_when_worker_stops(self):
+        m = self.m
+        cam = "cam-health-stop"
+        m.cam_status[cam] = {"running": True}
+        m.cam_health[cam] = {"fps": 25.0, "stalled": False, "state": "continue",
+                             "last_frame_at": time.time()}
+        try:
+            m.stop_camera_worker(cam)
+            snap = m.health_snapshot()[cam]
+            self.assertIsNone(snap["fps"])
+            self.assertFalse(snap["stalled"])
+            self.assertEqual(snap["state"], "stopped")
+            self.assertIsNone(snap["age_sec"])
+        finally:
+            m.cam_status.pop(cam, None)
+            m.cam_health.pop(cam, None)
+
     def test_terminate_process_reaps(self):
         proc = subprocess.Popen([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, lambda *a: None); time.sleep(60)"])
         self.m._terminate_process(proc, timeout=2)
